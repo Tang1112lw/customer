@@ -414,7 +414,7 @@ async fn tick(service: &Service, config: &CloudConfig) -> ApiResult<bool> {
     let Some(command) = poll(config).await? else {
         return Ok(false);
     };
-    let outcome = execute(service, &command).await;
+    let outcome = execute(service, config, &command).await;
     report(config, &command, outcome).await?;
     Ok(true)
 }
@@ -488,7 +488,7 @@ fn decode<T: serde::de::DeserializeOwned>(command: &Command) -> Result<T, Report
 }
 
 /// 执行命令。任何失败都转成回传结果，绝不中断轮询。
-async fn execute(service: &Service, command: &Command) -> Report {
+async fn execute(service: &Service, config: &CloudConfig, command: &Command) -> Report {
     match command.kind.as_str() {
         // 取密钥。注意：密钥缺失时辅助程序**可能重启微信**，云端只应在确认客户在场时下发。
         "wechat.bind" => match decode::<PrepareRequest>(command) {
@@ -510,6 +510,15 @@ async fn execute(service: &Service, command: &Command) -> Report {
         "wechat.collect" => match decode::<ArchiveRequest>(command) {
             Err(report) => report,
             Ok(request) => match service.export_and_upload(request).await {
+                Ok(data) => Report::ok(data),
+                Err(error) => Report::failed(error.code(), error.message()),
+            },
+        },
+        // 客户端自更新。自己覆盖不了正在运行的自己：这里只负责下载、校验、
+        // 落到 updates/<版本>/，真正的替换与重启交给 apply-update.ps1。
+        "agent.update" => match decode::<UpdateRequest>(command) {
+            Err(report) => report,
+            Ok(request) => match service.apply_update(config, request).await {
                 Ok(data) => Report::ok(data),
                 Err(error) => Report::failed(error.code(), error.message()),
             },
@@ -763,4 +772,147 @@ mod tests {
         // name 缺省时回落成 wxid
         assert_eq!(value["result"]["name"], "wxid_x");
     }
+}
+
+/// `agent.update` 命令的载荷：云端发布程序时算好的版本与摘要。
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct UpdateRequest {
+    /// 程序类型。云端 programs.json 里只会有 agent / key / export。
+    #[serde(default)]
+    kind: String,
+    version: String,
+    /// 发布时的文件名，例如 agent-0.1.2.exe。
+    #[serde(default)]
+    name: String,
+    /// 期望的 SHA-256（小写十六进制）。
+    sha256: String,
+    /// 字节数，只用于日志与界面提示。
+    #[serde(default)]
+    size: i64,
+}
+
+impl Service {
+    /// 客户端自更新：下载 → 校验 → 落盘 → 交接给外部脚本替换重启。
+    ///
+    /// 本函数返回后主进程仍会正常把命令结果回传云端；真正的替换发生在宽限期之后
+    /// （apply-update.ps1 先停服务进程，再覆盖 exe，最后按自启项把客户端拉起来）。
+    /// 云端不依赖这次回执判断成败 —— 它看重启后心跳带上来的版本号。
+    async fn apply_update(
+        &self,
+        config: &CloudConfig,
+        request: UpdateRequest,
+    ) -> ApiResult<Value> {
+        let install_dir = self.tools.parent().ok_or_else(ApiError::io)?.to_path_buf();
+        let version = request.version.trim().to_owned();
+        if version.is_empty() {
+            return Err(ApiError::helper("更新版本号为空"));
+        }
+        let kind = if request.kind.trim().is_empty() {
+            "agent".to_owned()
+        } else {
+            request.kind.trim().to_owned()
+        };
+        // 只接受 agent：key / export 是辅助程序，替换它们各自还有落地路径要处理。
+        if kind != "agent" {
+            return Err(ApiError::helper(format!("不支持的更新类型：{kind}")));
+        }
+        // 目标文件名固定：安装目录里 agent 恒为 aicrm_windows_api.exe。
+        // 云端清单里的 name 是**发布产物名**（如 agent-0.1.4.exe），拿它当替换目标
+        // 会往安装目录里多写一个文件、而真正要换的程序根本没动 —— 实测踩过这个坑。
+        let file_name = "aicrm_windows_api.exe".to_owned();
+        let artifact_name = request.name.trim().to_owned();
+        let updater = install_dir.join("aicrm-update.exe");
+        if !updater.is_file() {
+            return Err(ApiError::helper("安装目录缺少 aicrm-update.exe，无法完成自更新"));
+        }
+
+        let url = format!("{}/api/agent/v1/programs/{kind}", config.base_url());
+        let expected = request.sha256.trim().to_lowercase();
+        let device_token = config.device_token.clone();
+        let device_id = config.device_id.clone();
+        let stage_dir = install_dir.join("updates").join(&version);
+        // 闭包要拿走所有权，下面写 pending.json 还要用同一个名字，先复制一份。
+        let staged_name = file_name.clone();
+
+        let (size, digest) = blocking(move || {
+            std::fs::create_dir_all(&stage_dir).map_err(|_| ApiError::io())?;
+            let response = agent()
+                .get(&url)
+                .header("Authorization", &format!("Device {device_token}"))
+                .header("X-AICRM-Device-ID", &device_id)
+                .call()
+                .map_err(|error| ApiError::helper(format!("下载更新包失败：{error}")))?;
+            let bytes = response
+                .into_body()
+                .read_to_vec()
+                .map_err(|error| ApiError::helper(format!("读取更新包失败：{error}")))?;
+            let digest = crate::backend::sha256::hex_digest(&bytes);
+            if !expected.is_empty() && digest != expected {
+                return Err(ApiError::helper("更新包校验失败，已丢弃"));
+            }
+            std::fs::write(stage_dir.join(&staged_name), &bytes).map_err(|_| ApiError::io())?;
+            Ok((bytes.len(), digest))
+        })
+        .await?;
+
+        let requested_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_secs())
+            .unwrap_or(0);
+        let pending = json!({
+            "version": version,
+            "kind": kind,
+            "files": [{ "name": file_name, "sha256": digest, "size": size }],
+            "requestedAt": requested_at,
+        });
+        std::fs::write(
+            install_dir.join("updates").join("pending.json"),
+            serde_json::to_vec_pretty(&pending).map_err(|_| ApiError::io())?,
+        )
+        .map_err(|_| ApiError::io())?;
+
+        launch_updater(&updater, &install_dir)?;
+
+        Ok(json!({
+            "scheduled": true,
+            "version": version,
+            "size": size,
+            "artifact": artifact_name,
+            "declaredSize": request.size,
+            "from": env!("CARGO_PKG_VERSION"),
+            "message": "已下载并通过校验，正在后台替换并重启客户端",
+        }))
+    }
+}
+
+/// 拉起更新器并立即返回：它必须活过本进程，才能真正覆盖正在运行的 exe。
+///
+/// DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP 让脚本脱离父进程；否则调用方退出时
+/// 子进程会被一起收掉，替换永远不会发生。
+#[cfg(windows)]
+fn launch_updater(updater: &Path, install_dir: &Path) -> ApiResult<()> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+    Command::new(updater)
+        .arg("--install-dir")
+        .arg(install_dir)
+        .arg("--grace-seconds")
+        .arg("8")
+        .current_dir(install_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+        .map_err(|_| ApiError::helper("无法启动更新器"))?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn launch_updater(_updater: &Path, _install_dir: &Path) -> ApiResult<()> {
+    Err(ApiError::helper("当前平台不支持自更新"))
 }

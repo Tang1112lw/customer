@@ -25,7 +25,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::{Value, json};
-use std::{fs, io, path::PathBuf, process::Stdio, sync::Arc, time::Duration};
+use std::{fs, io, path::Path, path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 use tokio::{process::Command, sync::RwLock, time::timeout};
 
 pub type ApiResult<T> = Result<T, ApiError>;
@@ -131,6 +131,9 @@ impl Service {
         }
         fs::create_dir_all(&keys)?;
         fs::create_dir_all(data.join("jobs"))?;
+        // 记下自己的启动命令：自更新后由 aicrm-update.exe 原样重放。
+        // 重拼一遍服务参数只会引入"拼错就采不到数据"的风险。
+        record_startup_command(&data);
         let state = state_service::State::new(data.join("state"))?;
         let token = fs::read_to_string(token_file)?.trim().to_owned();
         if token.len() < 32 || !token.bytes().all(|b| b.is_ascii_graphic()) {
@@ -319,4 +322,28 @@ pub(crate) fn today() -> String {
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or(0);
     rfc3339(seconds + 8 * 3600)[..10].to_owned()
+}
+
+/// 把本次的启动命令行写进 `<data>/state/startup.json`。
+///
+/// 自更新时主进程会被杀掉，重新拉起需要与服务完全一致的参数（密钥目录、数据目录、
+/// 云端地址、设备令牌…）。这些参数由安装脚本拼过一次，记下来重放比在别处再拼一遍可靠。
+/// 写失败不影响启动 —— 只是自更新时会退回"只拉界面"。
+fn record_startup_command(data: &Path) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let payload = serde_json::json!({
+        "exe": exe.to_string_lossy(),
+        "args": arguments,
+    });
+    let directory = data.join("state");
+    if fs::create_dir_all(&directory).is_err() {
+        return;
+    }
+    let _ = fs::write(
+        directory.join("startup.json"),
+        serde_json::to_vec_pretty(&payload).unwrap_or_default(),
+    );
 }

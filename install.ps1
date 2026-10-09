@@ -110,6 +110,9 @@ Copy-Item -LiteralPath $consoleSource -Destination $consoleExe -Force
 # 把自己也留一份。客户端首次「连接云端」时会再调一次本脚本完成配对
 # （令牌生成、自启项重写、重启服务都在这里，没必要在 Rust 里重写一遍）。
 Copy-Item -LiteralPath $PSCommandPath -Destination (Join-Path $InstallDir 'install.ps1') -Force
+# 自更新执行者：客户端收到 agent.update 后靠它替换 exe 并重启。原生 exe，不经解释器。
+$updateSource = Resolve-Binary 'aicrm-update.exe'
+Copy-Item -LiteralPath $updateSource -Destination (Join-Path $InstallDir 'aicrm-update.exe') -Force
 # 服务启动时会校验 tools 目录里这两个程序存在；名字必须与 service 模块里的常量一致。
 Copy-Item -LiteralPath (Join-Path $ToolSource 'AICRM-Key.exe') -Destination (Join-Path $tools 'AICRM-Key.exe') -Force
 Copy-Item -LiteralPath $ExportProgram -Destination (Join-Path $tools 'aicrm-export-new.exe') -Force
@@ -196,6 +199,28 @@ if ($Endpoint) {
     $launcher = Join-Path $InstallDir '登录.cmd'
     $line = '@"{0}" --endpoint "{1}" --token-file "{2}" --device-file "{3}"' -f $loginExe, $Endpoint, $tokenFile, $deviceFile
     [IO.File]::WriteAllText($launcher, "@echo off`r`n$line`r`n", [Text.Encoding]::Default)
+}
+
+# ---- 桌面与开始菜单快捷方式 ----
+# 客户从桌面图标启动界面；托盘里常驻，不需要每次手动开。
+$shortcutTargets = @(
+    (Join-Path ([Environment]::GetFolderPath('Desktop')) 'AICRM 客户端.lnk'),
+    (Join-Path ([Environment]::GetFolderPath('Programs')) 'AICRM 客户端.lnk')
+)
+$shell = New-Object -ComObject WScript.Shell
+foreach ($shortcutPath in $shortcutTargets) {
+    try {
+        $link = $shell.CreateShortcut($shortcutPath)
+        $link.TargetPath = $consoleExe
+        $link.WorkingDirectory = $InstallDir
+        $link.IconLocation = "$consoleExe,0"
+        $link.Description = 'AICRM 客户端'
+        $link.Save()
+    }
+    catch {
+        # 快捷方式失败不该挡住安装 —— 自启已经写好，重开机能起来。
+        Write-Warning "创建快捷方式失败 $shortcutPath：$_"
+    }
 }
 
 # ---- 注册自启并立即启动 ----

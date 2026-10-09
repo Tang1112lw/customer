@@ -1,3 +1,4 @@
+pub(crate) mod sha256;
 pub mod service;
 pub mod tools_api;
 

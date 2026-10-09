@@ -1,6 +1,6 @@
 [package]
 name = "aicrm_windows_api"
-version = "0.1.0"
+version = "0.1.7"
 edition = "2024"
 
 # 后台服务：无界面，由 HKCU Run 隐藏启动
@@ -28,6 +28,12 @@ path = "src/forckend/setup.rs"
 [[bin]]
 name = "aicrm-pack"
 path = "src/pack/main.rs"
+
+# 自更新的外部执行者：等主进程退出后替换 exe 并重启。
+# 必须是原生 exe —— 客户机上 PowerShell 可能被安全软件拦掉。
+[[bin]]
+name = "aicrm-update"
+path = "src/update/main.rs"
 
 [dependencies]
 axum = "0.8"
