@@ -329,7 +329,7 @@ pub(crate) fn today() -> String {
 /// 自更新时主进程会被杀掉，重新拉起需要与服务完全一致的参数（密钥目录、数据目录、
 /// 云端地址、设备令牌…）。这些参数由安装脚本拼过一次，记下来重放比在别处再拼一遍可靠。
 /// 写失败不影响启动 —— 只是自更新时会退回"只拉界面"。
-fn record_startup_command(data: &Path) {
+pub(crate) fn record_startup_command(data: &Path) {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
@@ -346,4 +346,48 @@ fn record_startup_command(data: &Path) {
         directory.join("startup.json"),
         serde_json::to_vec_pretty(&payload).unwrap_or_default(),
     );
+}
+
+/// 读「已就绪、等待下次启动应用」的版本号。None 表示没有待应用的更新。
+pub(crate) fn pending_update_version(data: &Path) -> Option<String> {
+    let raw = fs::read_to_string(data.join("updates").join("pending.json")).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("version")
+        .and_then(|item| item.as_str())
+        .map(str::to_owned)
+        .filter(|item| !item.is_empty())
+}
+
+/// pending 是否比 current 更新。
+///
+/// 不能用 `!=` 判断：服务端若回退发布（或本地残留了一个更旧的标记），`!=` 会把
+/// 客户端硬拉回旧版本。点分数字比较，任一侧解析不出来就按"不更新"处理。
+pub(crate) fn newer_version(pending: &str, current: &str) -> bool {
+    fn parts(value: &str) -> Option<Vec<u64>> {
+        let text = value.trim().trim_start_matches(['v', 'V']);
+        if text.is_empty() {
+            return None;
+        }
+        let mut numbers = Vec::new();
+        for segment in text.split('.') {
+            let digits: String = segment.chars().take_while(|item| item.is_ascii_digit()).collect();
+            if digits.is_empty() {
+                return None;
+            }
+            numbers.push(digits.parse().ok()?);
+        }
+        Some(numbers)
+    }
+    let (Some(left), Some(right)) = (parts(pending), parts(current)) else {
+        return false;
+    };
+    for index in 0..left.len().max(right.len()) {
+        let a = left.get(index).copied().unwrap_or(0);
+        let b = right.get(index).copied().unwrap_or(0);
+        if a != b {
+            return a > b;
+        }
+    }
+    false
 }

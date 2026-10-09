@@ -23,7 +23,7 @@ use windows_sys::Win32::{
 const MUTEX_NAME: &str = r"Local\AICRM.WinClient";
 
 /// 已知界面窗口标题，按顺序试着把已有实例叫到前台。
-const TITLES: [&str; 2] = ["AICRM 客户端", "AICRM 安装"];
+const TITLES: [&str; 2] = ["AICRM", "AICRM 安装"];
 
 /// 持有的句柄。**必须活到进程结束**，否则互斥提前失效。
 static HANDLE: OnceLock<isize> = OnceLock::new();

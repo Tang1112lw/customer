@@ -318,7 +318,7 @@ fn run_installer(
 ///   已有实例就立刻退出），用户看到的现象是"点了没反应"。所以先找窗口叫到前台。
 /// - **没在跑** → 启动它，并把失败原因返回出去而不是吞掉。
 fn open_console() -> Result<String, String> {
-    const TITLE: &str = "AICRM 客户端";
+    const TITLE: &str = "AICRM";
     let wide: Vec<u16> = TITLE.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: 传入的是以 NUL 结尾的宽字符串。窗口类传空表示只按标题查找。
     let existing = unsafe {
@@ -530,7 +530,7 @@ impl eframe::App for SetupApp {
         egui::CentralPanel::default().show(ui, |ui| {
 
             ui.add_space(4.0);
-            ui.label(egui::RichText::new("AICRM 客户端安装").size(17.0).strong());
+            ui.label(egui::RichText::new("AICRM 安装").size(17.0).strong());
             ui.add_space(4.0);
             ui.label(theme::muted(
                 "正在安装，完成后会自动打开客户端。不需要填任何东西。",

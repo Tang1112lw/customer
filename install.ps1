@@ -204,8 +204,8 @@ if ($Endpoint) {
 # ---- 桌面与开始菜单快捷方式 ----
 # 客户从桌面图标启动界面；托盘里常驻，不需要每次手动开。
 $shortcutTargets = @(
-    (Join-Path ([Environment]::GetFolderPath('Desktop')) 'AICRM 客户端.lnk'),
-    (Join-Path ([Environment]::GetFolderPath('Programs')) 'AICRM 客户端.lnk')
+    (Join-Path ([Environment]::GetFolderPath('Desktop')) 'AICRM.lnk'),
+    (Join-Path ([Environment]::GetFolderPath('Programs')) 'AICRM.lnk')
 )
 $shell = New-Object -ComObject WScript.Shell
 foreach ($shortcutPath in $shortcutTargets) {
@@ -214,7 +214,7 @@ foreach ($shortcutPath in $shortcutTargets) {
         $link.TargetPath = $consoleExe
         $link.WorkingDirectory = $InstallDir
         $link.IconLocation = "$consoleExe,0"
-        $link.Description = 'AICRM 客户端'
+        $link.Description = 'AICRM'
         $link.Save()
     }
     catch {

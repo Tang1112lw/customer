@@ -326,3 +326,9 @@ Invoke-WebRequest "$base/api/aicrm/export/ai-bundle" -Method Post -Headers $head
    而不是悄悄写到别处。
 3. **子进程必须重定向 stdio**。子进程若继承父进程管道，父进程退出后写 stdout 会失败，
    而 Rust 的 `println!` 写失败会直接 panic 终止进程 —— 表现为「更新成功、进程却没了」。
+
+## 更新逻辑的权威规格
+
+更新链路的全局设计（版本状态机、完整时序、两端契约表、失败矩阵、并发与去重规则）
+见 AICRM 仓库的 support/docs/客户端自更新-全局设计.md。
+改客户端或云端的更新相关代码前，先对那张契约表 —— 历史故障全部来自「改了 A 端、没核对 B 端约束」。

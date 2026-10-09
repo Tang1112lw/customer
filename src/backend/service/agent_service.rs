@@ -550,6 +550,27 @@ fn cloud_result(command: &Command, outcome: &Report) -> Value {
 
     if outcome.success {
         let data = outcome.data.clone().unwrap_or(Value::Null);
+        // 只有绑定/采集类命令才需要那套「微信账号」形状的结果。
+        // 其余命令（例如 agent.update）原样透传自己的结果 —— 否则云端记下的是
+        // 一条 wxid 为空的绑定记录，更新出了问题时完全没法查。
+        if command.kind != "wechat.bind" && command.kind != "wechat.collect" {
+            // 云端对结果体是**严格解码**的：多一个未知字段整条回执就被判 400。
+            // 所以只发服务端认识的字段，把版本号与就绪状态填进去。
+            body.insert("status".into(), json!("succeeded"));
+            body.insert(
+                "result".into(),
+                json!({
+                    "wxid": "",
+                    "name": "",
+                    "platform": "windows",
+                    "keyReady": false,
+                    "databaseReady": false,
+                    "version": data.get("version").and_then(Value::as_str).unwrap_or_default(),
+                    "staged": data.get("staged").and_then(Value::as_bool).unwrap_or(false),
+                }),
+            );
+            return Value::Object(body);
+        }
         let flag = |key: &str| data.get(key).and_then(Value::as_bool).unwrap_or(true);
         let wxid = data
             .get("wxid")
@@ -831,6 +852,12 @@ impl Service {
             return Err(ApiError::helper("安装目录缺少 aicrm-update.exe，无法完成自更新"));
         }
 
+        // 幂等：同一个版本已经下载并校验过就直接回「已就绪」，别重复拉几 MB。
+        // 云端在冷却后会重复下发，这里挡掉多余流量。
+        if let Some(ready) = staged_ready(&install_dir, &version, &file_name) {
+            return Ok(ready);
+        }
+
         let url = format!("{}/api/agent/v1/programs/{kind}", config.base_url());
         let expected = request.sha256.trim().to_lowercase();
         let device_token = config.device_token.clone();
@@ -876,26 +903,30 @@ impl Service {
         )
         .map_err(|_| ApiError::io())?;
 
-        launch_updater(&updater, &install_dir)?;
-
+        // 到此为止，**不重启**。微信/QQ 都是「新版本就绪 → 下次启动应用」：
+        // 采集可能正在跑，正用着的时候把进程杀掉是产品事故。
+        // 真正的替换在下次启动时由 main() 交给 aicrm-update.exe 完成。
         Ok(json!({
-            "scheduled": true,
+            "staged": true,
             "version": version,
             "size": size,
             "artifact": artifact_name,
             "declaredSize": request.size,
             "from": env!("CARGO_PKG_VERSION"),
-            "message": "已下载并通过校验，正在后台替换并重启客户端",
+            "message": "新版本已下载并校验完成，将在下次启动时自动应用",
         }))
     }
 }
 
 /// 拉起更新器并立即返回：它必须活过本进程，才能真正覆盖正在运行的 exe。
 ///
+/// 只在「启动时发现有已就绪的新版本」这一条路径上调用 —— 也就是说更新发生在
+/// 客户自己下次打开程序的时候，而不是正用着的时候被强行重启（微信就是这个模型）。
+///
 /// DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP 让脚本脱离父进程；否则调用方退出时
 /// 子进程会被一起收掉，替换永远不会发生。
 #[cfg(windows)]
-fn launch_updater(updater: &Path, install_dir: &Path) -> ApiResult<()> {
+pub(crate) fn launch_updater(updater: &Path, install_dir: &Path) -> ApiResult<()> {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -917,7 +948,7 @@ fn launch_updater(updater: &Path, install_dir: &Path) -> ApiResult<()> {
 }
 
 #[cfg(not(windows))]
-fn launch_updater(_updater: &Path, _install_dir: &Path) -> ApiResult<()> {
+pub(crate) fn launch_updater(_updater: &Path, _install_dir: &Path) -> ApiResult<()> {
     Err(ApiError::helper("当前平台不支持自更新"))
 }
 
@@ -977,4 +1008,26 @@ async fn refresh_bound_wechat(service: &Service, config: &CloudConfig) -> ApiRes
         Ok(())
     })
     .await
+}
+
+/// 判断某个版本是否已经下载并校验过。已就绪就返回回执，免得重复下载。
+fn staged_ready(install_dir: &Path, version: &str, file_name: &str) -> Option<Value> {
+    let updates = install_dir.join("updates");
+    let pending = updates.join("pending.json");
+    let raw = std::fs::read_to_string(&pending).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    if value.get("version").and_then(|item| item.as_str()) != Some(version) {
+        return None;
+    }
+    let staged = updates.join(version).join(file_name);
+    if !staged.is_file() {
+        return None;
+    }
+    Some(json!({
+        "staged": true,
+        "version": version,
+        "size": std::fs::metadata(&staged).map(|item| item.len()).unwrap_or(0),
+        "from": env!("CARGO_PKG_VERSION"),
+        "message": "该版本此前已下载完成，将在下次启动时自动应用",
+    }))
 }

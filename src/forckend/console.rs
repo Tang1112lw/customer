@@ -76,11 +76,11 @@ fn main() -> eframe::Result {
             // 控制面板本来也不需要缩放
             .with_resizable(false)
             .with_visible(!hidden)
-            .with_title("AICRM 客户端"),
+            .with_title("AICRM"),
         ..Default::default()
     };
     eframe::run_native(
-        "AICRM 客户端",
+        "AICRM",
         options,
         Box::new(move |cc| {
             install_cjk_font(&cc.egui_ctx);
@@ -900,11 +900,8 @@ impl Console {
                         self.page = Page::Config;
                     }
 
-                    // 版本号沉到最底，不占导航的视线
-                    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                        ui.add_space(14.0);
-                        ui.label(theme::faint(&format!("v{}", env!("CARGO_PKG_VERSION"))));
-                    });
+                    // 界面不显示版本号（对外只叫 AICRM）。版本仍随心跳上报，
+                    // 需要时在云端「设备」页看。
                 });
             });
     }

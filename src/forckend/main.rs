@@ -45,7 +45,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([360.0, 228.0])
             .with_resizable(false)
-            .with_title("AICRM 登录"),
+            .with_title("AICRM"),
         ..Default::default()
     };
     eframe::run_native(

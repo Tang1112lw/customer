@@ -66,7 +66,7 @@ impl Tray {
 
         let icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("AICRM 客户端")
+            .with_tooltip("AICRM")
             .with_icon(status_icon(false))
             // 左键留给"开关窗口"，菜单只在右键时出现
             .with_menu_on_left_click(false)
