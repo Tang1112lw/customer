@@ -349,8 +349,12 @@ pub(crate) fn record_startup_command(data: &Path) {
 }
 
 /// 读「已就绪、等待下次启动应用」的版本号。None 表示没有待应用的更新。
-pub(crate) fn pending_update_version(data: &Path) -> Option<String> {
-    let raw = fs::read_to_string(data.join("updates").join("pending.json")).ok()?;
+///
+/// 参数是**安装目录**（exe 所在目录），不是数据目录 —— `updates/` 与 `data/` 是
+/// 安装目录下的两个平级目录。这里曾经错传成数据目录，导致启动检查永远读到 None，
+/// 「下次启动应用更新」整条路径静默失效（诊断行会打印「待应用版本 None」）。
+pub(crate) fn pending_update_version(install_dir: &Path) -> Option<String> {
+    let raw = fs::read_to_string(install_dir.join("updates").join("pending.json")).ok()?;
     let value: Value = serde_json::from_str(&raw).ok()?;
     value
         .get("version")
@@ -390,4 +394,29 @@ pub(crate) fn newer_version(pending: &str, current: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::newer_version;
+
+    /// 这类判断反复出过错（用 != 会把客户端拉回旧版本），所以把边界钉死在测试里。
+    #[test]
+    fn newer_version_边界() {
+        assert!(newer_version("0.1.16", "0.1.15"));
+        assert!(newer_version("0.2.0", "0.1.99"));
+        assert!(newer_version("1.0.0", "0.9.9"));
+        // 段数不同按缺位补 0
+        assert!(newer_version("0.1.15.1", "0.1.15"));
+        assert!(!newer_version("0.1.15", "0.1.15"));
+        assert!(!newer_version("0.1.15", "0.1.16"));
+        assert!(!newer_version("0.1", "0.1.0"));
+        // 允许 v 前缀与 -beta 后缀
+        assert!(newer_version("v0.1.16", "0.1.15"));
+        assert!(newer_version("0.1.16-beta", "0.1.15"));
+        // 解析不出来一律不更新（宁可不动，也不能乱动）
+        assert!(!newer_version("", "0.1.15"));
+        assert!(!newer_version("abc", "0.1.15"));
+        assert!(!newer_version("0.1.16", ""));
+    }
 }

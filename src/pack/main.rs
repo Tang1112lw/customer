@@ -58,7 +58,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = std::env::args()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| release.join(format!("AICRM-{}.exe", env!("CARGO_PKG_VERSION"))));
+        // 对外只叫 AICRM：文件名里不带 Setup、也不带版本号（版本在程序内部右下角）。
+        .unwrap_or_else(|| release.join("AICRM.exe"));
 
     // ① 组载荷 zip
     let mut payload: Vec<u8> = Vec::new();

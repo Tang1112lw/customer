@@ -27,25 +27,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 允许调用本客户端接口的网页来源，可重复。部署到客户机器时用来放行云端域名。
     let mut allow_origins: Vec<String> = Vec::new();
 
-    // 启动时先看有没有「已就绪」的新版本：有就交给更新器替换并重启，
-    // 然后本进程退出。微信就是这个模型 —— 更新在下次启动时生效，
-    // 客户正用着的时候绝不会被打断（采集跑到一半被杀就是事故）。
-    if let Some(version) = backend::service::pending_update_version(&data) {
-        if !backend::service::newer_version(&version, env!("CARGO_PKG_VERSION")) {
-            // 不比当前新（已经应用过，或服务端回退发布）→ 清掉标记，绝不当降级用
-            let _ = std::fs::remove_file(data.join("updates").join("pending.json"));
-        } else {
-            backend::service::record_startup_command(&data);
-            let updater = root.join("aicrm-update.exe");
-            if updater.is_file()
-                && backend::service::agent_service::launch_updater(&updater, &root).is_ok()
-            {
-                println!("发现已就绪的新版本 {version}，交给更新器应用后重启");
-                return Ok(());
-            }
-        }
-    }
-
     let mut args = env::args().skip(1);
     while let Some(flag) = args.next() {
         if flag == "--help" {
@@ -82,6 +63,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // 无条件打一行关键路径与待更新状态：更新出问题时，这一行能直接定位是
+    // 「没下载到」「路径不对」还是「版本比较判成了不更新」。
+    println!(
+        "启动：程序目录 {}；数据目录 {}；待应用版本 {:?}；当前版本 {}",
+        root.display(),
+        data.display(),
+        backend::service::pending_update_version(&root),
+        env!("CARGO_PKG_VERSION")
+    );
+
+    // 启动时先看有没有「已就绪」的新版本：有就交给更新器替换并重启，
+    // 然后本进程退出。微信就是这个模型 —— 更新在下次启动时生效，
+    // 客户正用着的时候绝不会被打断（采集跑到一半被杀就是事故）。
+    if let Some(version) = backend::service::pending_update_version(&root) {
+        if !backend::service::newer_version(&version, env!("CARGO_PKG_VERSION")) {
+            // 不比当前新（已经应用过，或服务端回退发布）→ 清掉标记，绝不当降级用
+            let _ = std::fs::remove_file(root.join("updates").join("pending.json"));
+        } else {
+            backend::service::record_startup_command(&data);
+            let updater = root.join("aicrm-update.exe");
+            if updater.is_file()
+                && backend::service::agent_service::launch_updater(&updater, &root).is_ok()
+            {
+                println!("发现已就绪的新版本 {version}，交给更新器应用后重启");
+                return Ok(());
+            }
+        }
+    }
+
+    // 参数解析完毕，data 目录已确定，这时才能找「已就绪」的更新。
     // 文件优先于命令行：命令行里的令牌会出现在进程列表和 HKCU Run 自启项中。
     let device_token = match (device_token_file, device_token) {
         (Some(path), _) => Some(std::fs::read_to_string(&path).map_err(|error| {

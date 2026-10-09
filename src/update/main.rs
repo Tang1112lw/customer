@@ -19,6 +19,9 @@ use std::time::Duration;
 #[path = "../backend/sha256.rs"]
 mod sha256;
 
+#[path = "shortcut.rs"]
+mod shortcut;
+
 /// 替换前要停掉的客户端程序。按镜像名杀 —— 客户机上只有安装目录一份，
 /// 比按路径过滤简单，也避免依赖 CIM/WMI（部分机器上被安全软件禁用）。
 const CLIENT_PROGRAMS: [&str; 4] = [
@@ -40,9 +43,25 @@ const ALLOWED_TARGETS: [&str; 4] = [
 
 fn main() {
     let options = Options::parse();
+    // 安装时的入口创建走同一条实现：客户机上 COM/PowerShell 可能被安全软件
+    // 拦掉，自己写 .lnk 不依赖它们。
+    if options.ensure_shortcut {
+        match shortcut::refresh(&options.install_dir, &options.log_file()) {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("建快捷方式失败：{error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if let Err(error) = apply(&options) {
         log(&options.log_file(), &format!("更新失败：{error}"));
         write_result(&options, "failed", &error);
+        // 出错时也要保证客户端是活的：更新器已经把它停掉了，自己再躺下的话
+        // 这台机器就彻底哑了。已经活着就什么都不做（多数情况是并发实例已重启过）。
+        if !service_alive() {
+            let _ = start_clients(&options);
+        }
         std::process::exit(1);
     }
 }
@@ -50,6 +69,8 @@ fn main() {
 struct Options {
     install_dir: PathBuf,
     grace: Duration,
+    /// 安装脚本用它来建入口 —— 同一个实现，不重复造一份。
+    ensure_shortcut: bool,
 }
 
 impl Options {
@@ -59,6 +80,7 @@ impl Options {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("AICRM-Windows-API");
         let mut grace = 8u64;
+        let mut ensure_shortcut = false;
         let mut arguments = std::env::args().skip(1);
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
@@ -67,6 +89,7 @@ impl Options {
                         install_dir = PathBuf::from(value);
                     }
                 }
+                "--ensure-shortcut" => ensure_shortcut = true,
                 "--grace-seconds" => {
                     if let Some(value) = arguments.next() {
                         grace = value.parse().unwrap_or(8);
@@ -79,6 +102,7 @@ impl Options {
             install_dir,
             // 上限兜一下：宽限期只是等主进程回传结果，不该无限期拖着。
             grace: Duration::from_secs(grace.min(120)),
+            ensure_shortcut,
         }
     }
 
@@ -114,6 +138,10 @@ fn apply(options: &Options) -> Result<(), String> {
     if items.is_empty() {
         return Err("pending.json 里没有文件".to_owned());
     }
+    // 读完立刻消费掉这个标记。更新器重启客户端之后，新起的服务会再检查一次
+    // pending —— 若不消费，它会拉起**第二个更新器**，那个实例读不到标记就报失败，
+    // 顺手把刚拉起的进程杀掉，这台机器就变成采不到数据的哑机（实测踩过）。
+    let _ = std::fs::remove_file(&pending_file);
     log(&options.log_file(), &format!("开始应用更新 {version}"));
 
     // ① 复算摘要。下载与校验在两个进程里做过，这里是最后一道闸。
@@ -175,6 +203,11 @@ fn apply(options: &Options) -> Result<(), String> {
     log(&options.log_file(), "替换完成，重启客户端");
     start_clients(options)?;
     confirm_restart(options, &replaced, &backup)?;
+    // 快捷方式与过期安装包的收尾：失败不该让整次更新作废（exe 已经换好了），
+    // 只记一行日志，下次启动还会再补一次。
+    if let Err(error) = shortcut::refresh(&options.install_dir, &options.log_file()) {
+        log(&options.log_file(), &format!("快捷方式收尾失败：{error}"));
+    }
     let _ = std::fs::remove_file(&pending_file);
     let message = format!("已更新到 {version}；旧版本备份在 {}", backup.display());
     write_result(options, "applied", &message);

@@ -923,6 +923,11 @@ impl Console {
                         // 连接引导在主内容区里也要能画：它跟主界面共用顶栏
                         Page::Connect => self.connect_page(ui),
                     }
+                    // 版本号放窗口内右下角：对外只叫 AICRM，版本信息在程序内部可见。
+                    ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
+                        ui.add_space(4.0);
+                        ui.label(theme::faint(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+                    });
                 });
         });
     }

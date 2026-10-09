@@ -240,6 +240,12 @@ Set-ItemProperty -Path $runKey -Name 'AICRM-客户端' -Value ('"{0}" --hidden' 
 # 但装完这一次要弹出来，不然客户不知道装了什么
 Start-Process -FilePath $consoleExe -WorkingDirectory $InstallDir
 
+# ---- 快捷方式：桌面 + 开始菜单，客户唯一需要认识的入口 ----
+# 由 aicrm-update.exe 用 COM IShellLink 建（纯 Rust，不经脚本宿主）——
+# 客户机上脚本宿主常被安全软件拦掉，安装与自更新共用同一份实现。
+# 它同时会把历史遗留的重复入口与过期安装包收走。
+& (Join-Path $InstallDir 'aicrm-update.exe') --ensure-shortcut --install-dir $InstallDir | Out-Null
+
 $ready = $false
 for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Milliseconds 500
@@ -258,6 +264,7 @@ Write-Output "开机登录自启：HKCU Run\AICRM-Windows-API"
 Write-Output "密钥目录：$KeyDir"
 Write-Output "本地 API token：$tokenFile"
 Write-Output "主窗口：$consoleExe"
+Write-Output "快捷方式：AICRM.lnk（桌面 + 开始菜单）"
 Write-Output "登录窗口：$loginExe"
 if ($Endpoint) { Write-Output "登录启动器：$(Join-Path $InstallDir '登录.cmd')" }
 else { Write-Output '提示：加 -Endpoint <云端登录地址> 可生成登录启动器' }
