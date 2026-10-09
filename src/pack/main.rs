@@ -16,7 +16,8 @@
 //! cargo run --release --bin aicrm-pack [输出路径]
 //! ```
 //!
-//! 默认输出 `target/release/AICRM-客户端安装程序.exe`。
+//! 默认输出 `target/release/AICRM-<版本号>.exe`，版本号取自 `Cargo.toml`，
+//! 不用手工同步。
 
 use std::{
     fs,
@@ -56,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = std::env::args()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| release.join("AICRM-客户端安装程序.exe"));
+        .unwrap_or_else(|| release.join(format!("AICRM-{}.exe", env!("CARGO_PKG_VERSION"))));
 
     // ① 组载荷 zip
     let mut payload: Vec<u8> = Vec::new();
