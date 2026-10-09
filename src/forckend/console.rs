@@ -262,6 +262,20 @@ fn stop_service() {
         .output();
 }
 
+/// 结束除自己以外的全部客户端进程（本地服务、登录器、托盘）。
+///
+/// 托盘「退出」要的是"干净地关掉"，而不只是关掉界面 —— 本地服务是独立进程，
+/// 不显式收掉就会留在后台占着 8765：用户以为退出了、其实还在跑，重启或重装
+/// 都得先去任务管理器手动杀进程。调用者自己不在这个列表里，由调用处 process::exit 退出。
+fn stop_other_client_processes() {
+    for name in ["aicrm_windows_api.exe", "aicrm-login.exe", "aicrm-tray.exe"] {
+        let _ = Command::new("taskkill")
+            .args(["/IM", name, "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+    }
+}
+
 /// 是否已经有另一个实例在跑（自己也在进程列表里，所以数到 2 才算重复）。
 ///
 /// 没有用互斥量：托盘每次点击都会拉起一次程序，开出一串窗口是必然的事故，
@@ -800,7 +814,12 @@ impl eframe::App for Console {
                     self.refresh();
                 }
                 // 直接退出进程：走视口 Close 会再触发一次下面的关闭拦截
-                Some(shell::Action::Quit) => std::process::exit(0),
+                Some(shell::Action::Quit) => {
+                    // 托盘「退出」= 完全退出：先收掉本地服务等子进程，再退自己。
+                    // 只关界面会把 aicrm_windows_api.exe 留在后台占着 8765。
+                    stop_other_client_processes();
+                    std::process::exit(0);
+                }
                 None => {}
             }
         }

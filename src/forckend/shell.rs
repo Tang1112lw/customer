@@ -27,7 +27,7 @@ pub enum Action {
     Toggle,
     StartService,
     StopService,
-    /// 真正退出程序（服务不受影响，它是独立进程）
+    /// 完全退出：连本地服务等子进程一起收掉，不再留后台进程
     Quit,
 }
 
@@ -51,7 +51,7 @@ impl Tray {
         let toggle = MenuItem::new("打开主界面", true, None);
         let start = MenuItem::new("启动服务", true, None);
         let stop = MenuItem::new("停止服务", true, None);
-        let quit = MenuItem::new("退出（不影响服务）", true, None);
+        let quit = MenuItem::new("退出（同时停止服务）", true, None);
 
         let menu = Menu::new();
         menu.append_items(&[
