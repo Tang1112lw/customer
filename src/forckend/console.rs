@@ -411,6 +411,9 @@ struct Snapshot {
     /// 令牌类型（云端会话 / 本地令牌）+ 写入时间
     token: Option<(String, Option<SystemTime>)>,
     accounts: Vec<String>,
+    /// 真正可用的微信号：密钥本体与解密缓存（cache/）都在。
+    /// 只有密钥没有 cache 时导出读不到库，必须区分出来。
+    accounts_ready: Vec<String>,
     credential_ready: bool,
     /// 微信号（昵称），从导出的 messages.json 里找；找不到回落显示 wxid
     wechat_name: Option<String>,
@@ -515,13 +518,24 @@ fn snapshot() -> Snapshot {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with("wxid_") && entry.path().is_dir() {
-                if entry.path().join("credentials.local.json").is_file() {
+                // 一个微信号的密钥要「真的能用」得两样都在：
+                //   credentials.local.json —— 抓到的密钥本体
+                //   cache/                 —— 用它解密出来的聊天数据库
+                // 只有密钥没有 cache 时，导出程序读不到聊天库会一直空等
+                // （实测卡到云端 15 分钟超时），界面却写着「密钥就绪」。
+                let has_credential = entry.path().join("credentials.local.json").is_file();
+                let has_cache = entry.path().join("cache").is_dir();
+                if has_credential {
                     snap.credential_ready = true;
+                }
+                if has_credential && has_cache {
+                    snap.accounts_ready.push(name.clone());
                 }
                 snap.accounts.push(name);
             }
         }
         snap.accounts.sort();
+        snap.accounts_ready.sort();
     }
     if !snap.accounts.is_empty() {
         snap.wechat_name = self_name_from_exports(&dir.join("data").join("jobs"));
@@ -1261,15 +1275,22 @@ impl Console {
         // 本机 accounts 目录里可能躺着别的账号采集过的密钥，拿第一个顶上会让客户
         // 以为已经绑好了（实测踩过：登录 liang，卡片却显示 test2 的微信号）。
         let bound = self.snap.bound_wxid.clone();
+        // 「就绪」= 密钥与解密缓存都在；只有密钥时是「密钥不完整」——
+        // 此时导出读不到聊天库，必须让客户看见，而不是写「就绪」。
         let bound_ready = bound
+            .as_ref()
+            .map(|wxid| self.snap.accounts_ready.iter().any(|item| item == wxid))
+            .unwrap_or(false);
+        let bound_has_credential = bound
             .as_ref()
             .map(|wxid| self.snap.accounts.iter().any(|item| item == wxid))
             .unwrap_or(false);
         let others = self.snap.accounts.len().saturating_sub(usize::from(bound_ready));
-        let (color, status) = match (bound.is_some(), bound_ready) {
-            (false, _) => (theme::IDLE, "未绑定"),
-            (true, true) => (theme::OK, "密钥就绪"),
-            (true, false) => (theme::WARN, "缺密钥"),
+        let (color, status) = match (bound.is_some(), bound_ready, bound_has_credential) {
+            (false, _, _) => (theme::IDLE, "未绑定"),
+            (true, true, _) => (theme::OK, "密钥就绪"),
+            (true, false, true) => (theme::WARN, "密钥不完整"),
+            (true, false, false) => (theme::WARN, "缺密钥"),
         };
         theme::card(ui, width, |ui| {
             theme::card_head_rev(ui, "密钥获取", color, status);
@@ -1286,6 +1307,9 @@ impl Console {
                     ui.add(egui::Label::new(theme::value(&display)).truncate());
                     if bound_ready {
                         ui.label(theme::faint(wxid));
+                    } else if bound_has_credential {
+                        ui.label(theme::faint(&format!("已抓到 {wxid} 的密钥，但缺少解密缓存")));
+                        ui.label(theme::faint("请在微信已登录时重新绑定以获取密钥"));
                     } else {
                         ui.label(theme::faint(&format!("尚未采集 {wxid} 的密钥")));
                     }
