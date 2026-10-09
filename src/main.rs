@@ -74,6 +74,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .filter(|token| !token.is_empty());
 
     backend::set_allowed_origins(allow_origins);
+    // 客户端连哪个云端，就自动信任来自该云端地址的网页 —— 不用为部署地址改代码。
+    backend::set_cloud_origin(cloud_url.clone(), cloud_url_file.clone());
 
     let service = Service::new(tools, keys, data, token_file)?;
 

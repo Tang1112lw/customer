@@ -21,15 +21,41 @@ use std::sync::Arc;
 ///
 /// **部署到客户机器时必须改**：客户的网页是云端的 HTTPS 域名，不是 localhost。
 /// 用命令行的 `--allow-origin` 追加，或设环境变量 `AICRM_ALLOWED_ORIGINS`（逗号分隔）。
-const DEFAULT_ALLOWED_ORIGINS: [&str; 6] = [
+const DEFAULT_ALLOWED_ORIGINS: [&str; 4] = [
     "http://localhost:5000",
     "http://127.0.0.1:5000",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    // 云端部署的网页前端（轻量云 Caddy 直出），浏览器从这里发起到本机客户端的采集调用
-    "http://162.14.83.205",
-    "https://162.14.83.205",
 ];
+
+/// 客户端连的是哪个云端，就信任来自同一云端地址的网页 —— 页面发起的采集调用
+/// 天然只应该来自用户自己部署的前端。基地址支持文件（隧道地址会变），所以
+/// 这里存的是「来源」而不是解析结果：每次校验都现读现算，改文件立即生效。
+static CLOUD_ORIGIN_SOURCE: std::sync::OnceLock<Option<(Option<String>, Option<std::path::PathBuf>)>> =
+    std::sync::OnceLock::new();
+
+/// 注册云端基地址来源：`--cloud-url` / `--cloud-url-file` 的值。
+pub fn set_cloud_origin(static_url: Option<String>, file: Option<std::path::PathBuf>) {
+    let _ = CLOUD_ORIGIN_SOURCE.set(Some((static_url, file)));
+}
+
+/// 从云端基地址推导出允许的网页来源（`scheme://host[:port]`）。
+fn cloud_origin() -> Option<String> {
+    let (static_url, file) = CLOUD_ORIGIN_SOURCE.get()?.as_ref()?;
+    let base_url = match file {
+        Some(path) => std::fs::read_to_string(path).ok()?.trim().to_owned(),
+        None => static_url.clone()?,
+    };
+    if base_url.is_empty() {
+        return None;
+    }
+    let (scheme, rest) = base_url.split_once("://")?;
+    let authority = rest.split('/').next()?;
+    if authority.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{authority}"))
+}
 
 /// 运行时来源白名单。由 `main` 启动时注入；没注入就退回默认值。
 static ALLOWED_ORIGINS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -60,10 +86,16 @@ pub fn set_allowed_origins(extra: Vec<String>) {
 }
 
 fn origin_allowed(origin: &str) -> bool {
-    ALLOWED_ORIGINS
+    if ALLOWED_ORIGINS
         .get()
         .map(|list| list.iter().any(|item| item == origin))
         .unwrap_or_else(|| DEFAULT_ALLOWED_ORIGINS.contains(&origin))
+    {
+        return true;
+    }
+    // 云端同源放行：网页来自客户端所连的云端地址（host:port 完全一致）才通过，
+    // 路径、协议差异都算不同来源。
+    cloud_origin().is_some_and(|allowed| allowed == origin)
 }
 
 /// 给响应补上 CORS 头，并直接应答预检。
