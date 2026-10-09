@@ -1,0 +1,56 @@
+[package]
+name = "aicrm_windows_api"
+version = "0.1.0"
+edition = "2024"
+
+# 后台服务：无界面，由 HKCU Run 隐藏启动
+[[bin]]
+name = "aicrm_windows_api"
+path = "src/main.rs"
+
+# 登录窗口：图形程序，用户手动打开，换取云端会话令牌
+[[bin]]
+name = "aicrm-login"
+path = "src/forckend/main.rs"
+
+# 主窗口：一屏看状态（服务/登录/微信/云端），启停服务，并常驻通知区托盘。
+# 点 × 只隐藏窗口不退出，真正的退出在托盘菜单里。
+[[bin]]
+name = "aicrm-console"
+path = "src/forckend/console.rs"
+
+# 一键安装：图形安装程序，自动配对并装盘
+[[bin]]
+name = "aicrm-setup"
+path = "src/forckend/setup.rs"
+
+# 打包工具（不随客户端分发）：把安装器与全部载荷拼成单文件安装程序
+[[bin]]
+name = "aicrm-pack"
+path = "src/pack/main.rs"
+
+[dependencies]
+axum = "0.8"
+async-stream = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "process", "io-util", "sync", "time", "fs", "signal"] }
+zip = { version = "7.0.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+# 登录窗口用；glow 比默认的 wgpu 轻得多，且在远程桌面下更稳
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow"] }
+# 阻塞式 HTTP，比 reqwest 少一大截依赖；登录调用跑在独立线程里
+ureq = "3"
+uuid = { version = "1", features = ["v4"] }
+# 系统托盘（muda 菜单由 tray-icon 重导出）
+tray-icon = "0.26"
+winit = "0.30"
+# 安装器要用 FindWindowW/ShowWindow 把已在运行的客户端窗口叫到前台
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

@@ -1,0 +1,181 @@
+# AICRM Windows API
+
+作者：Tang。当前 API 使用 Windows 0.4.7 的 `AICRM-Key.exe`（取密钥、列本地账号）与 `AICRM-Export.exe`（导出 `messages.json`，云端流水线吃这个），程序文件来自用户提供的 `4.1.13.65 -4.1.15.13 聊天记录导出程序`，不修改原辅助程序。人工查阅用的 `messages.md` 由第三个程序 `aicrm-export-new.exe` 产出（不在仓库里，用 `install.ps1 -ExportProgram` 指定路径）。Rust 服务在**当前用户登录后**由 Windows `HKCU\...\Run` 启动；微信数据和密钥属于当前用户，因此无需以 SYSTEM 身份运行。
+
+## 程序清单
+
+`Cargo.toml` 声明六个二进制（其中 `aicrm-pack` 是打包工具，不随客户端分发）：
+
+| 二进制 | 入口 | 作用 | 用法 |
+| --- | --- | --- | --- |
+| `aicrm_windows_api` | `src/main.rs` | 后台服务：HTTP 接口 + 云端命令通道 | 无界面，由 `HKCU\...\Run` 隐藏启动 |
+| `aicrm-login` | `src/forckend/main.rs` | 登录窗口（egui） | `--endpoint` / `--token-file` / `--device-file`，见下 |
+| `aicrm-console` | `src/forckend/console.rs` | 主窗口：一屏看状态（服务/登录/微信/云端）+ 启停服务 + 去登录 | 无参数；`--start-service` 只起服务不显示窗口 |
+| `aicrm-tray` | `src/forckend/tray.rs` | 系统托盘：看服务状态、打开主界面、启停服务、退出 | `--bind` / `--data-dir`；退出时会一并 `taskkill` 掉后台服务 |
+| `aicrm-setup` | `src/forckend/setup.rs` | 图形一键安装：登录云端 → 自动申领配对码 → 调 `install.ps1` 装盘 | `--endpoint`；`--extract-only` 自检内嵌载荷。单文件形态由 `aicrm-pack` 拼出 |
+| `aicrm-pack` | `src/pack/main.rs` | 打包工具：安装器 + 全部载荷 → 单文件安装程序 | `cargo run --release --bin aicrm-pack [输出路径]` |
+
+三件事值得记一笔：
+
+- **外观统一**：`src/forckend/theme.rs` 是三个窗口共用的外观（浅色底、白卡片、描边、留白），各自 `mod theme;` 指向同一份文件，不引入共享库。
+- **主窗口不依赖服务**：它直接读安装目录里的文件（令牌、密钥、`cloud.url`、`data/jobs`），因为它的职责之一就是"服务没跑时把服务拉起来"。宽高固定、长文本截断，避免窄窗口把中文挤成竖排。
+- **单文件安装程序**：`aicrm-pack` 把 `aicrm-setup.exe` 与载荷 zip 拼在一起，页脚 `[offset u64][len u64]["AICRMSFX"]`；安装器启动时读自身末尾定位并解压载荷，没有页脚就退回"同目录"布局。载荷清单在 `src/pack/main.rs` 顶部。
+
+托盘图标颜色就是服务状态（绿=运行中、灰=已停止），菜单里「令牌」一项看 `api.token` 是否非空；「服务在不在」是直接连 `--bind` 端口判定的，比查进程名更能说明"到底能不能用"。
+
+## 安装与运行
+
+在本项目目录运行 `./install.ps1`。脚本编译 Rust 服务，把三个客户端程序（`aicrm_windows_api.exe`、`aicrm-login.exe`、`aicrm-tray.exe`）、`AICRM-Key.exe` 与 Markdown 导出程序放到 `%LOCALAPPDATA%\AICRM-Windows-API\`，生成权限限定为当前用户、SYSTEM 和管理员的 `api.token`，注册登录自启并立即启动。现有密钥仍读取本项目 `src\tools\accounts\`，不会复制或删除。服务默认监听 `127.0.0.1:8765`。需要更换密钥目录或监听地址时使用 `./install.ps1 -KeyDir 'D:\密钥目录' -Bind '127.0.0.1:8765'`。重新运行安装脚本会更新程序并重启服务，不会更换已有 token。
+
+接入云端命令通道用 `./install.ps1 -CloudUrl <云端基地址> -DeviceId <云端签发的设备 ID> -ProvisionCode <预置码>`；客户网页是云端域名时再加 `-AllowOrigin <域名>`（可重复或逗号分隔）。安装脚本会把云端地址写进 `%LOCALAPPDATA%\AICRM-Windows-API\cloud.url`，隧道地址变了只改这个文件再重启服务，不用重装。
+
+**缺口（安装脚本尚未覆盖）**：`/api/aicrm/collect` 与 `wechat.collect` 要跑 `AICRM-Export.exe`，而 `install.ps1` 只把 `AICRM-Key.exe` 和 Markdown 导出程序复制进 `tools\`。`Service::new` 也只校验 `AICRM-Key.exe` 与 `aicrm-export-new.exe` 这两个（`archive_service` 的 `AICRM-Export.exe` 不在启动校验里），所以缺 `AICRM-Export.exe` 不会让服务启动失败，但采集会在运行时以「辅助程序启动失败」告终 —— 部署时要手动把它放进 `tools\`。
+
+`./uninstall.ps1` 只删除登录自启项并停止服务，保留程序、密钥、token 和导出文件。手动启动命令可查看 `install.ps1` 写入的 `HKCU:\Software\Microsoft\Windows\CurrentVersion\Run\AICRM-Windows-API` 值。
+
+## 登录窗口
+
+`aicrm-login.exe` 是给 Windows 客户端用的图形程序（`src/forckend/`），与后台服务分开：用户在这里输入账号密码，向云端换取**会话令牌**，写进本地令牌文件供后台服务鉴权。**密码完全由云端校验**，本地不保存、不比对 —— 本地校验等于在客户端藏一份密码哈希，可被替换或绕过。
+
+```powershell
+./target/release/aicrm-login.exe --endpoint https://你的云端/api/auth/login
+```
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--endpoint` | `http://127.0.0.1:8000/api/auth/login` | 云端登录接口，**正式环境必须 HTTPS** |
+| `--token-file` | `%LOCALAPPDATA%\AICRM-Windows-API\api.token` | 会话令牌写入位置，与后台服务读取的是同一个文件 |
+| `--device-file` | `%LOCALAPPDATA%\AICRM-Windows-API\device.id` | 设备标识，首次运行生成后固定不变 |
+
+令牌文件写好后会尽力用 `icacls` 把权限收紧到当前用户 / SYSTEM / Administrators。**后台服务需重启才会读取新令牌**（服务的令牌是启动时读一次）。
+
+### 云端登录接口契约
+
+客户端发起的这个请求**不带 `Authorization` 头** —— 它就是"用密码换令牌"的入口，不可能要求令牌。代价是它天然是公开端点，防滥用只能靠**强制 HTTPS + 云端失败次数限制**，客户端无能为力。
+
+```http
+POST <endpoint>
+Content-Type: application/json
+
+{"username":"zhangsan","password":"…","device_id":"3f2a…","client_version":"0.1.0"}
+```
+
+成功 `200 OK`（`{code, message, data}` 信封，令牌在 `data` 里）：
+
+```json
+{"code":0,"message":"success","data":{
+  "accessToken":"eyJ…","refreshToken":"eyJ…",
+  "user":{"user":{"name":"张三","username":"zhangsan"}}}}
+```
+
+失败（`message` 会原样显示给用户）：
+
+```json
+{"code":401,"message":"账号或密码错误","data":null}
+```
+
+客户端要求 `code == 0` **且**响应里带 `data.accessToken`；缺 `data` 或信封形状不对会报「云端返回的不是 {code,message,data} 信封 / 云端返回成功但缺少 data」，那属于前后端版本不匹配，不是凭据问题。`refreshToken` 目前只被解析和打码保留，尚未用于自动续期。客户端把 `4xx` 当作"凭据错误、重试无用"，把 `5xx` 与网络故障当作"可重试"。云端签发令牌后应把它与该 `device_id` 一起入库，**之后云端调用本地 API 时用的就是这同一个令牌** —— 所以令牌不需要任何人工"交付"。`device_id` 让云端能够单独撤销某一台设备而不影响其他设备。
+
+### 本地联调
+
+云端还没就绪时，可用仓库根目录的两个假云端脚本跑通两条链路。
+
+`mock-cloud.ps1` 答登录接口（账号 `demo` / 密码 `123456`，其它组合返回 401）：
+
+```powershell
+Start-Process pwsh -ArgumentList '-NoProfile','-File','.\mock-cloud.ps1','-Port','9413','-LogFile',"$env:TEMP\req.txt" -WindowStyle Hidden
+./target/debug/aicrm-login.exe --endpoint http://127.0.0.1:9413/api/auth/login --token-file "$env:TEMP\api.token"
+```
+
+`req.txt` 会记下客户端实际发出的原始请求，便于核对契约。
+
+`mock-agent-cloud.ps1` 答命令通道，用来在没有真云端时验证「云端下发命令 → 客户端执行 → 回传结果」：
+
+```powershell
+Start-Process pwsh -ArgumentList '-NoProfile','-File','.\mock-agent-cloud.ps1','-Port','9414' -WindowStyle Hidden
+./target/release/aicrm_windows_api.exe --cloud-url http://127.0.0.1:9414 --device-token dev-token --device-id dev-1 --bind 127.0.0.1:8765
+```
+
+它只下发一次 `wechat.export`（`-MaxCommands` 可调），收到结果后退出。它不实现心跳端点 `/api/agent/v1/status`，也不支持 `wechat.bind` / `wechat.collect`，因此服务日志里会出现心跳 404 —— 只影响日志，不影响那条导出命令的往返。
+
+## 接口
+
+除下面单列的握手端点外，所有接口都要求 `Authorization: Bearer <token>`，token 在 `%LOCALAPPDATA%\AICRM-Windows-API\api.token`。接口层只解析请求、调用 `backend/service/` 的函数。该目录按辅助程序拆分：`service/mod.rs` 是共享底座（服务状态、进程调用、并发闸门、`authorize` 鉴权中间件），`service/key_service.rs` 承载 `AICRM-Key.exe` 业务（密钥准备、账号查询），`service/export_service.rs` 承载 `aicrm-export-new.exe` 业务（Markdown 导出执行、结果打包与 NDJSON），`service/archive_service.rs` 承载 `AICRM-Export.exe` + 归档上传（数据采集闭环上半段），`service/agent_service.rs` 是云端命令通道（长轮询 + 心跳）。
+
+鉴权不在各模块内单独实现，而是在 `backend/mod.rs` 的 `app()` 里通过唯一的 `route_layer` 统一施加到全部已注册路由上。新增模块只需写一个 `pub fn router() -> Router<Arc<Service>>` 并在 `app()` 中 `merge` 一行，其所有接口自动受保护，无需写任何鉴权代码；所有 `merge` 都必须写在 `route_layer` 之前。用 `route_layer` 而非 `layer`，是为了让未匹配的路径保持 404 而不是变成 401。`backend/mod.rs` 的测试会遍历表里全部 11 个接口，确认无 token、错 token、其它认证方案均返回 401。
+
+| 方法 | 路径 | 功能 |
+| --- | --- | --- |
+| GET | `/api/aicrm/key/version` | Key 版本 |
+| GET | `/api/aicrm/export/version` | Export 版本 |
+| GET | `/api/aicrm/key/help` | Key 命令行帮助 |
+| GET | `/api/aicrm/export/help` | Export 命令行帮助 |
+| GET | `/api/aicrm/accounts` | 列出本地已保存密钥的 wxid，不返回密钥 |
+| POST | `/api/aicrm/prepare` | 验证或捕获密钥；缺少有效密钥时辅助程序可能重启微信 |
+| POST | `/api/aicrm/export` | 运行导出，文件保留在本地 `data\jobs\`，返回结果与路径 |
+| POST | `/api/aicrm/export/stream` | 运行导出，返回本次每个 `messages.json` 文档的 NDJSON；不含附件字节 |
+| POST | `/api/aicrm/export/bundle` | 下载原始 JSON 和附件 ZIP |
+| POST | `/api/aicrm/export/ai-bundle` | 下载原始 JSON、附件及精简 `chat.txt` ZIP |
+| POST | `/api/aicrm/collect` | 数据采集：后台导出两个程序、合并归档包并上传云端；**立即返回 202，不等导出跑完** |
+
+导出请求示例：`{"wxid":"wxid_xxx","day":14}`。`wxid` 可省略，由辅助程序识别当前账号；`person` 可限定联系人或群名；`day` 为含今天的最近 N 天；`start` 与 `end` 必须同时提供，且不能和 `day` 同用。`task_id`、`wechat_dir` 可选；`export_dir` 是云端指定的落盘目录，给了就直接导到那里（不清理、不删），不给才用 `data\jobs\<id>` 临时目录。请求体带 `deny_unknown_fields`，字段名写错会立刻 422 而不是被静默忽略。未指定联系人和日期即导出全部历史。每个请求使用独立导出目录，所以多个导出可并发；密钥准备操作与导出互斥（同一个 `RwLock` 闸门）。
+
+`/api/aicrm/collect` 的请求体是另一套字段，全部必填：`task_id`、`execution_token`、`user_token`、`upload_url`（形如 `https://云端/api/tasks/<taskId>/upload`），加上与导出同名的可选筛选 `wxid` / `person` / `day` / `start` / `end`。它**不能在请求里等到底**：导出要跑几分钟，挂在请求里的话浏览器一切页面、刷新或关标签就会断开连接、handler 被丢弃，采集被一起取消（归档目录写到一半不动、云端任务永远停在 `created`，实测踩过）。所以它只把活儿丢进后台就回 202，前端照旧轮询 `GET /api/tasks/{id}` 看进度。上传用 multipart，字段名必须是 `file`，并同时带 `X-Execution-Token` 与 `Authorization: Bearer <user_token>` —— 只带执行令牌会被云端 401。
+
+`/stream` 的格式是 Windows 专用 `aicrm-windows-files/v1`：首行 `meta`，每个文件一行 `{"type":"file","path":".../messages.json","document":{...}}`，末行 `summary`。它不伪装成 Android 的 `aicrm-compact/v1`。需要语音、图片等附件时调用 ZIP 接口。
+
+AI ZIP 中 `chat.txt` 按会话和日期分组，保留消息顺序、发送方向及文本。群消息在源数据有成员信息时标注成员。语音只写 `[语音:相对路径]`；原程序未导出音频文件的语音写 `[语音]`。原始 `messages.json` 和附件逐字节保留在 ZIP 对应目录，用于核对。ZIP 或 NDJSON 响应完成或连接中断后，服务会删除本次临时导出文件；`/export` 返回的本地文件则保留，需自行清理。
+
+### 握手端点与 CORS
+
+| 方法 | 路径 | 鉴权 | 功能 |
+| --- | --- | --- | --- |
+| GET | `/api/aicrm/session` | 无（改为校验 `Origin`） | 把本机令牌交给浏览器里的 AICRM 前端 |
+
+浏览器里的前端读不到 `api.token` 文件（网页没有文件系统权限），所以需要一个握手端点把令牌交给它。它刻意挂在鉴权层之外，但不等于敞开：**只有 `Origin` 在白名单里才返回令牌**，否则 403 `FORBIDDEN_ORIGIN`。浏览器一定会带 `Origin` 且页面脚本改不了它，所以恶意网页拿不到；本机上的其它进程本来就能直接读令牌文件，威胁面没有变大。响应只含 `token` 与 `base_url`，不含任何业务数据。
+
+来源白名单默认是四个本机回环地址（`http://localhost:5000`、`http://127.0.0.1:5000`、`http://localhost:3000`、`http://127.0.0.1:3000`）。**部署到客户机器时必须加**：客户的网页是云端的 HTTPS 域名。用 `--allow-origin <域名>`（可重复）追加，或设环境变量 `AICRM_ALLOWED_ORIGINS`（逗号分隔）；命令行值在环境变量值之后追加去重。`install.ps1` 的 `-AllowOrigin` 就是往自启项里写这个参数。
+
+CORS 中间件包在最外层（比鉴权还外）：预检 `OPTIONS` 不带 `Authorization`，交给鉴权层只会得到 401，所以由中间件直接回 204。响应只在来源被放行时回 `Access-Control-Allow-Origin`（刻意不用 `*`，接口需要凭据），并回 `Access-Control-Allow-Headers: Authorization, Content-Type`、`Access-Control-Max-Age: 600` 与 `access-control-allow-private-network: true` —— 最后这个头是给「公网 HTTPS 页面访问本机 127.0.0.1」用的，Chrome 会先发预检并要求它，不回的话请求在浏览器里就被拦掉，服务端连日志都没有。
+
+### 命令行参数（后台服务）
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--tools-dir` / `--key-dir` / `--data-dir` / `--token-file` | 可执行文件同级的 `tools\` / `accounts\` / `data\` / `api.token` | 目录与令牌位置 |
+| `--bind` | `127.0.0.1:8765` | 监听地址 |
+| `--allow-origin` | 见上 | 追加网页来源白名单，可重复 |
+| `--cloud-url` | 无 | 云端基地址，如 `https://api.example.com` |
+| `--cloud-url-file` | 无 | 从文件读云端基地址。**隧道地址会变时用这个**：每轮轮询都重读文件，改文件即可，不用重装 |
+| `--device-token` | 无 | 设备令牌明文写在命令行，仅调试用 |
+| `--device-token-file` | 无 | 设备令牌文件（推荐：不会出现在进程列表和自启项里）。与 `--device-token` 同给时以文件为准 |
+| `--device-id` | 无 | 设备标识 |
+
+### 云端命令通道
+
+客户端装在客户的 Windows 电脑上，位于 NAT 之后、没有公网 IP，云端无法主动连进来，所以方向反过来：客户端定时向云端取命令，执行完回传。**`--device-token*`、`--device-id` 三项齐全，且 `--cloud-url` / `--cloud-url-file` 至少有一个**才启用轮询，否则只跑本地 API。
+
+- 心跳：每 20 秒 `PUT <cloud>/api/agent/v1/status`。云端靠它判断设备在线，没有心跳网页端就不允许对这台设备下发采集任务。`wechat.online` 要求微信进程在跑、wxid 已绑定、本地库在、密钥就绪，任一不成立就如实报 `false`。
+- 取命令：`POST <cloud>/api/agent/v1/commands/poll` 长轮询，挂起 `waitSeconds=25` 秒。
+- 回传：`PUT <cloud>/api/agent/v1/commands/<id>/result`。
+- 命令类型三种：`wechat.bind`（取密钥，可能重启微信，云端只应在确认客户在场时下发）、`wechat.export`（导出，结果留在本机）、`wechat.collect`（导出 + 归档上传，结果交回云端）。不支持的类型回 `UNSUPPORTED_COMMAND`，不会中断轮询。
+- 这三个请求都用 `Authorization: Device <token>` + `X-AICRM-Device-ID` 两个头，与本地 API 的 `Bearer` 不是同一套。
+
+## 本机调用
+
+```powershell
+$base = 'http://127.0.0.1:8765'
+$token = [IO.File]::ReadAllText((Join-Path $env:LOCALAPPDATA 'AICRM-Windows-API\api.token')).Trim()
+$headers = @{ Authorization = "Bearer $token" }
+Invoke-RestMethod "$base/api/aicrm/accounts" -Headers $headers
+
+$body = @{ day = 14 } | ConvertTo-Json -Compress
+Invoke-WebRequest "$base/api/aicrm/export/ai-bundle" -Method Post -Headers $headers `
+  -ContentType 'application/json; charset=utf-8' `
+  -Body ([Text.Encoding]::UTF8.GetBytes($body)) `
+  -OutFile "$env:USERPROFILE\Desktop\测试\windows-ai.zip"
+```
+
+2026-09-29 本机真实接口测试：两个导出请求同时执行成功。14 天全联系人 AI ZIP 中有 120 个原始聊天 JSON、2,527 条消息、35 条语音消息，其中 30 个有音频文件、5 个源程序未导出文件。`chat.txt` 有 2,527 条消息行、74,413 字符，无 `<voicemsg>` XML；所有 30 个语音文件引用均可在 ZIP 中找到。NDJSON 有 122 行（meta + 120 文件 + summary），消息数一致。传输后临时任务目录为空。测试产物在 `C:\Users\11589\Desktop\测试\AICRM_Windows_API_20260929\`。服务启动、Bearer 鉴权（无 token 返回 401）及登录自启注册已核对；实际注销后重新登录的自动启动尚未测试。
+
+随后单独复测最终版 NDJSON，源数据增加至 2,541 条消息，末行 summary 成功且不含已删除的临时路径。密钥接口用 `no_restart=true` 验证成功，返回值不含密钥正文；单联系人原始 ZIP 包含 5 个 JSON 和 2 个音频文件；`/export` 的本地文件模式返回 185 条消息、5 个 JSON，结果保留在其 `job_dir`。两个帮助接口均返回 200。

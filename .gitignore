@@ -1,0 +1,9 @@
+/target
+/src/tools/accounts/
+/.idea/
+# 联调/试跑留下的运行时产物（假云端导出目录、锁文件），不是源码
+/support/runtime/
+
+# 载荷二进制（打包时本地放入，不进 Git）
+/src/tools/*.exe
+/src/tools/cache/

@@ -1,0 +1,133 @@
+AICRM Windows 0.4.7 使用手册
+===============================
+
+一、文件用途
+
+1. AICRM-Key.exe
+   只负责自动识别微信数据位置、获取/验证数据库密钥并保存。
+   不包含聊天记录导出功能。
+
+2. AICRM-Export.exe
+   只负责读取已保存密钥并导出聊天记录。
+   不会注入、关闭或重启微信。
+
+3. accounts\
+   默认密钥和账号配置目录。请勿随意删除 credentials.local.json。
+   微信重启后密钥通常仍可复用，不需要重新捕获。
+
+4. exports\
+   默认聊天记录导出目录。
+
+
+二、第一次获取密钥
+
+在当前目录空白处按住 Shift 并点击鼠标右键，选择“在终端中打开”，运行：
+
+  .\AICRM-Key.exe --key-dir ".\accounts"
+
+程序会自动寻找微信数据目录。没有旧密钥时，微信可能被重新启动；请按提示
+完成登录并进入微信主界面。程序会逐个验证数据库密钥，核心数据库 9/9 即成功。
+
+如果自动识别不到微信数据目录，可明确指定：
+
+  .\AICRM-Key.exe --wechat-dir "D:\app\xwechat_files" --key-dir ".\accounts"
+
+微信安装在特殊位置时还可指定：
+
+  .\AICRM-Key.exe --weixin-exe "D:\app\wechatdata\Weixin\Weixin.exe" --key-dir ".\accounts"
+
+
+三、以后复用密钥
+
+再次执行相同命令即可。程序会先验证 accounts 中保存的密钥；验证通过会直接
+显示“复用，未重新抓取”，不会重启微信。也可以跳过密钥程序，直接运行导出程序。
+
+只有换账号、数据库重新生成、旧密钥验证失败，或手动删除
+credentials.local.json 时，才需要重新捕获。
+
+
+四、导出全部聊天记录
+
+  .\AICRM-Export.exe --key-dir ".\accounts" --export-dir ".\exports"
+
+也可以把密钥目录和导出目录放到任意位置：
+
+  .\AICRM-Export.exe --key-dir "D:\微信密钥" --output "E:\聊天导出"
+
+
+五、按联系人和日期筛选
+
+导出某联系人最近 7 天：
+
+  .\AICRM-Export.exe --person "张三" --day 7 --key-dir ".\accounts" --output ".\exports"
+
+导出指定日期范围：
+
+  .\AICRM-Export.exe --person "张三" --start 2026-09-01 --end 2026-09-14 --key-dir ".\accounts" --output ".\exports"
+
+只指定日期、不指定联系人时，会导出该日期范围内的全部会话。
+
+自动识别失败时可增加聊天数据目录：
+
+  .\AICRM-Export.exe --wechat-dir "D:\app\xwechat_files" --key-dir ".\accounts" --output ".\exports"
+
+
+六、导出格式
+
+每个账号一个微信号目录，每个联系人一个目录，每天一个目录和 UTF-8 JSON；
+附件也严格按消息日期分类：
+
+  导出目录\
+    wxid_xxx\
+      联系人\
+        2026-08-20\
+          messages.json
+          audio\
+            10_voice_voice_10.silk
+          images\
+            27_image_xxx.dat
+          videos\
+            15_video_xxx.mp4
+          files\
+
+当前支持状态：
+
+  文字              已导出到 JSON
+  原始语音          已导出为 .silk
+  视频              本机存在时导出为 .mp4
+  图片              已定位并导出，但 4.1.13 的 .dat 仍为加密容器
+  普通文件          尽力复制，不是当前重点
+
+
+七、常用参数
+
+  --key-dir          指定密钥保存或读取目录
+  --wechat-dir       指定 xwechat_files、账号目录或 db_storage
+  --export-dir       指定聊天记录导出目录
+  --output           Key 程序中等同 --key-dir；Export 程序中等同 --export-dir
+  --person           联系人或群名称
+  --day              最近多少天（含今天）
+  --start / --end    精确日期范围，格式 YYYY-MM-DD
+  --expected-wxid    限定账号，防止选择错误账号
+  --capture-timeout  首次捕获等待秒数，范围 10-300
+  --force            忽略已有密钥并重新捕获；日常不要使用
+  --json             输出机器可读的 NDJSON 状态
+
+
+八、两个程序能否同时运行
+
+可以。已有有效密钥时，AICRM-Key.exe 做验证，AICRM-Export.exe 独立读取密钥并
+导出。密钥写入采用原子替换，避免导出程序读到写了一半的文件。
+
+首次捕获尚未成功时，应先等待 AICRM-Key.exe 显示核心数据库 9/9，再启动导出。
+
+
+九、重要提醒
+
+accounts\ 中的密钥和 exports\ 中的聊天记录均为敏感本地数据，请妥善保存，
+不要上传公共网盘或发送给无关人员。
+
+
+十、测试报告
+
+程序旁的 0.4.7_真实测试报告.txt 记录了真实全量导出结果和全部命令测试。
