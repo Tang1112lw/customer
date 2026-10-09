@@ -80,6 +80,16 @@ impl Service {
             return Err(ApiError::bad("upload_url 必须是 http(s) 地址"));
         }
 
+        // 微信没就绪就别开工：导出程序会一直等数据库，最后拖到云端 15 分钟超时，
+        // 用户只看到「采集卡住」而拿不到原因（实测：有凭据但没有解密缓存，
+        // 说明密钥没抓全 —— 微信进程在跑、却读不到库）。
+        let probe = crate::backend::service::agent_service::WeChatProbe::detect(self);
+        if !probe.online() {
+            return Err(ApiError::bad(format!(
+                "本机微信未就绪：{}。请先打开并登录微信，再重新绑定以获取密钥。",
+                probe.reason()
+            )));
+        }
         // 幂等：这个任务已经传成功过就直接复用结果。
         // 云端正常不会重发同一个 task_id，但客户端崩溃重启、命令重复投递时会；
         // 大聊天库导出动辄一小时，没必要为同一批消息付第二次。

@@ -267,7 +267,7 @@ fn self_name_in_export(path: &Path) -> Option<String> {
 /// 云端要求：只有 `online=true` 的设备才允许被下发采集任务，而 `online=true` 必须同时
 /// 满足 wxid 非空、state=="ready"、进程在跑、账号在、库在、凭据就绪。任何一项不成立都
 /// 如实报 false —— 宁可让用户看到"未就绪"，也不要让云端以为可以采集。
-struct WeChatProbe {
+pub(crate) struct WeChatProbe {
     wxid: String,
     /// 微信号（昵称），从本地导出的 messages.json 里找：机主发消息时
     /// sender.is_self == true，那个 sender.display_name 就是微信号。
@@ -280,7 +280,7 @@ struct WeChatProbe {
 }
 
 impl WeChatProbe {
-    fn detect(service: &Service) -> Self {
+    pub(crate) fn detect(service: &Service) -> Self {
         let mut probe = Self {
             wxid: String::new(),
             name: String::new(),
@@ -317,7 +317,7 @@ impl WeChatProbe {
         probe
     }
 
-    fn online(&self) -> bool {
+    pub(crate) fn online(&self) -> bool {
         self.process_running
             && self.account_present
             && self.database_present
@@ -325,7 +325,7 @@ impl WeChatProbe {
             && !self.wxid.is_empty()
     }
 
-    fn reason(&self) -> String {
+    pub(crate) fn reason(&self) -> String {
         if self.online() {
             return String::new();
         }
