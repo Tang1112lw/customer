@@ -21,11 +21,14 @@ use std::sync::Arc;
 ///
 /// **部署到客户机器时必须改**：客户的网页是云端的 HTTPS 域名，不是 localhost。
 /// 用命令行的 `--allow-origin` 追加，或设环境变量 `AICRM_ALLOWED_ORIGINS`（逗号分隔）。
-const DEFAULT_ALLOWED_ORIGINS: [&str; 4] = [
+const DEFAULT_ALLOWED_ORIGINS: [&str; 6] = [
     "http://localhost:5000",
     "http://127.0.0.1:5000",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    // 云端部署的网页前端（轻量云 Caddy 直出），浏览器从这里发起到本机客户端的采集调用
+    "http://162.14.83.205",
+    "https://162.14.83.205",
 ];
 
 /// 运行时来源白名单。由 `main` 启动时注入；没注入就退回默认值。
