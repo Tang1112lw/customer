@@ -29,6 +29,38 @@
 
 在本项目目录运行 `./install.ps1`。脚本编译 Rust 服务，把三个客户端程序（`aicrm_windows_api.exe`、`aicrm-login.exe`、`aicrm-tray.exe`）、`AICRM-Key.exe` 与 Markdown 导出程序放到 `%LOCALAPPDATA%\AICRM-Windows-API\`，生成权限限定为当前用户、SYSTEM 和管理员的 `api.token`，注册登录自启并立即启动。现有密钥仍读取本项目 `src\tools\accounts\`，不会复制或删除。服务默认监听 `127.0.0.1:8765`。需要更换密钥目录或监听地址时使用 `./install.ps1 -KeyDir 'D:\密钥目录' -Bind '127.0.0.1:8765'`。重新运行安装脚本会更新程序并重启服务，不会更换已有 token。
 
+### 设备归属：会话制（2026-10-09 起）
+
+**设备不归账号所有。** 配对（`device.token`）只解决"这台机器是不是真的"，不决定"谁能用它"。后者由云端会话表 `aicrm_agent_device_sessions(device_id, user_id)` 表达，由心跳维护：
+
+```text
+客户端登录账号 A → api.token 落盘
+        ↓ 下一个心跳（≤20 秒）
+PUT /api/agent/v1/status
+    Authorization: Device <设备令牌>      ← 证明"我是这台电脑"
+    X-AICRM-User-Token: <A 的 JWT>        ← 证明"现在登录的是 A"
+        ↓
+云端登记 / 刷新 (这台设备, A) 的会话
+        ↓
+网页端用 A 登录就能看到这台客户端，可以绑定、可以采集
+```
+
+由此得到的行为，**完全不需要实施人员介入**：
+
+| 场景 | 结果 |
+|---|---|
+| 客户端登录 A，网页也登录 A | 网页看得到，可绑定可采集 |
+| 客户端换成 B | 下一个心跳登记 B，网页用 B 登录即生效，**不需要重启客户端、不需要重新配对** |
+| 网页登录这台机器上从没登录过的 C | 0 台设备，按钮置灰 |
+
+设计要点：
+
+- **不挪任何归属字段。** 早前的"认领制"（把设备记录改挂到某账号）会和按账号隔离的数据打架 —— 设备被挪走，`wechat_accounts`、历史任务还留在旧账号名下，绑定就出错。会话制只在旁边加一行记录，谁的数据都不动。
+- **失败不影响心跳。** 令牌过期、账号被禁用只是"这次没登记"，服务照常用。心跳挂了会让整台设备判离线，代价比归属错高得多。
+- **切换延迟 20 秒，不需要重启。** 客户端不需要为换账号做任何事，更不需要修改服务端或用认领接口去挪归属记录。
+
+云端侧的实现说明见服务端仓库 `support/docs/device-session-model.md`。
+
 ### 安装与配对是两件事
 
 **安装**只负责放文件、注册开机自启，不需要任何账号：
@@ -188,6 +220,7 @@ CORS 中间件包在最外层（比鉴权还外）：预检 `OPTIONS` 不带 `Au
 客户端装在客户的 Windows 电脑上，位于 NAT 之后、没有公网 IP，云端无法主动连进来，所以方向反过来：客户端定时向云端取命令，执行完回传。**`--device-token*`、`--device-id` 三项齐全，且 `--cloud-url` / `--cloud-url-file` 至少有一个**才启用轮询，否则只跑本地 API。
 
 - 心跳：每 20 秒 `PUT <cloud>/api/agent/v1/status`。云端靠它判断设备在线，没有心跳网页端就不允许对这台设备下发采集任务。`wechat.online` 要求微信进程在跑、wxid 已绑定、本地库在、密钥就绪，任一不成立就如实报 `false`。
+  **心跳还顺带把登录账号带给云端**（`X-AICRM-User-Token`，每次现读 `api.token`）—— 这决定了网页端登录哪个账号才看得见这台客户端，详见下方「设备归属：会话制」。
 - 取命令：`POST <cloud>/api/agent/v1/commands/poll` 长轮询，挂起 `waitSeconds=25` 秒。
 - 回传：`PUT <cloud>/api/agent/v1/commands/<id>/result`。
 - 命令类型三种：`wechat.bind`（取密钥，可能重启微信，云端只应在确认客户在场时下发）、`wechat.export`（导出，结果留在本机）、`wechat.collect`（导出 + 归档上传，结果交回云端）。不支持的类型回 `UNSUPPORTED_COMMAND`，不会中断轮询。
