@@ -77,7 +77,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 客户端连哪个云端，就自动信任来自该云端地址的网页 —— 不用为部署地址改代码。
     backend::set_cloud_origin(cloud_url.clone(), cloud_url_file.clone());
 
-    let service = Service::new(tools, keys, data, token_file)?;
+    // 令牌文件路径后面还要给设备认领用（读登录令牌），这里保留一份。
+    let service = Service::new(tools, keys, data, token_file.clone())?;
 
     // 云端地址可以来自命令行，也可以来自文件 —— 隧道地址会变时用文件更方便：
     // 改文件即可，不用重装客户端。两者至少要有一个。
@@ -96,6 +97,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             agent_service::CloudConfig {
                 base_url: cloud_url.unwrap_or_default(),
                 base_url_file: cloud_url_file,
+                // 设备归属跟着登录账号走：换账号登录后重启客户端，设备自动改挂过去。
+                user_token_file: Some(token_file.clone()),
                 device_token,
                 device_id,
                 interval: POLL_INTERVAL,

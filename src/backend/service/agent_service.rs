@@ -67,6 +67,10 @@ const POLL_WAIT_SECONDS: u64 = 25;
 /// 取 20 秒留出抖动余量。
 const HEARTBEAT_SECONDS: u64 = 20;
 
+/// 认领设备的间隔。客户端换账号登录后通常要重启才生效，10 分钟足够兜住
+/// 「只换了 api.token 但没重启服务」的情况。
+const CLAIM_INTERVAL_SECONDS: u64 = 600;
+
 /// 云端基地址与设备凭据。
 #[derive(Clone, Debug)]
 pub struct CloudConfig {
@@ -75,6 +79,13 @@ pub struct CloudConfig {
     /// 从文件读取云端的基地址。隧道（cloudflared / serveo 等）每次重启地址都会变，
     /// 把它放进文件后，地址变了只要改文件 —— 不用重装客户端。
     pub base_url_file: Option<std::path::PathBuf>,
+    /// 本机登录账号的云端令牌文件（api.token）。
+    ///
+    /// 设备归属要跟着「客户端登录的是哪个账号」走：客户在自己电脑上登录谁的账号，
+    /// 这台设备就归谁。客户端每次启动就拿这个令牌去云端认领一次，换账号登录
+    /// （重新登录会让登录程序重写这个文件）后设备自动改挂到新账号下 —— 网页
+    /// 端因此总能看到自己名下的这台客户端，不需要人工改库或重新配对。
+    pub user_token_file: Option<std::path::PathBuf>,
     pub device_token: String,
     pub device_id: String,
     /// 轮询间隔。太密会被云端限流，太疏用户点了要等。
@@ -176,6 +187,18 @@ pub fn spawn(service: std::sync::Arc<Service>, config: CloudConfig) {
                 eprintln!("心跳上报失败：{}", error.message());
             }
             tokio::time::sleep(Duration::from_secs(HEARTBEAT_SECONDS)).await;
+        }
+    });
+
+    let claim_config = config.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        loop {
+            // 认领失败只打印：它不影响本地 API 和命令轮询，下次循环再试。
+            if let Err(error) = claim_device(&claim_config).await {
+                eprintln!("认领设备失败：{}", error.message());
+            }
+            tokio::time::sleep(Duration::from_secs(CLAIM_INTERVAL_SECONDS)).await;
         }
     });
 
@@ -383,6 +406,47 @@ async fn send_heartbeat(service: &Service, config: &CloudConfig) -> ApiResult<()
             return Err(ApiError::helper(format!("心跳被拒：HTTP {status}")));
         }
         Ok(())
+    })
+    .await
+}
+
+/// 认领本机设备：把它的归属改到当前登录账号名下。
+///
+/// 需要同时出示两样东西 —— 设备令牌（证明这台机器是我的）和用户令牌
+/// （证明我要挂到哪个账号）。缺了用户令牌就跳过：只跑本地 API 的机器没有登录态，
+/// 云端也不会有它要认领的设备。
+async fn claim_device(config: &CloudConfig) -> ApiResult<bool> {
+    let Some(path) = &config.user_token_file else {
+        return Ok(false);
+    };
+    let path = path.clone();
+    let user_token = blocking(move || {
+        std::fs::read_to_string(&path)
+            .map(|text| text.trim().to_owned())
+            .map_err(|error| ApiError::helper(format!("读取登录令牌失败：{error}")))
+    })
+    .await?;
+    if user_token.is_empty() {
+        return Ok(false);
+    }
+
+    let config = config.clone();
+    blocking(move || {
+        let endpoint = format!(
+            "{}/api/ui/v1/devices/{}/claim",
+            config.base_url(),
+            config.device_id
+        );
+        let response = agent()
+            .post(&endpoint)
+            .header("Authorization", format!("Bearer {user_token}"))
+            .header("Content-Type", "application/json")
+            .send(serde_json::json!({ "deviceToken": config.device_token }).to_string())
+            .map_err(|error| ApiError::helper(format!("云端不可达：{error}")))?;
+        if !response.status().is_success() {
+            return Err(ApiError::helper(format!("认领被拒：HTTP {}", response.status())));
+        }
+        Ok(true)
     })
     .await
 }
