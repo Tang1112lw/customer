@@ -38,7 +38,10 @@ pub(crate) const ARCHIVE_PROGRAM: &str = super::export_service::EXPORT_PROGRAM;
 const ARCHIVE_SCHEMA: &str = "aicrm-chat-archive/v2";
 
 /// 导出超时。聊天库大时这个程序会跑很久。
-const ARCHIVE_TIMEOUT: Duration = Duration::from_secs(1800);
+// 必须小于云端僵尸任务阈值（backend/internal/aicrm/cleanup: StaleTaskTimeout=15 分钟），
+// 否则导出超过 15 分钟时云端会先判死，客户端还在傻等，最后给出误导性原因。
+// 留 ~3 分钟余量给上传与状态回报。实测踩过 30 分钟这种不自洽的配置。
+const ARCHIVE_TIMEOUT: Duration = Duration::from_secs(720);
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
