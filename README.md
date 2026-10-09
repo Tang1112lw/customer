@@ -1,6 +1,6 @@
 # AICRM Windows API
 
-作者：Tang。当前 API 使用 Windows 0.4.7 的 `AICRM-Key.exe`（取密钥、列本地账号）与 `AICRM-Export.exe`（导出 `messages.json`，云端流水线吃这个），程序文件来自用户提供的 `4.1.13.65 -4.1.15.13 聊天记录导出程序`，不修改原辅助程序。人工查阅用的 `messages.md` 由第三个程序 `aicrm-export-new.exe` 产出（不在仓库里，用 `install.ps1 -ExportProgram` 指定路径）。Rust 服务在**当前用户登录后**由 Windows `HKCU\...\Run` 启动；微信数据和密钥属于当前用户，因此无需以 SYSTEM 身份运行。
+作者：Tang。当前 API 只依赖两个辅助程序：Windows 0.4.7 的 `AICRM-Key.exe`（取密钥、列本地账号）与 `aicrm-export-new.exe`（导出 `messages.md`，人工查阅与云端 AI 分析共用同一份 Markdown）。导出程序文件来自用户提供的 `4.1.13.65 -4.1.15.13 聊天记录导出程序`，不修改原辅助程序。原先产 `messages.json` 的 `AICRM-Export.exe` 已不再需要：2026-10 起云端归档与 AI 分析输入都直接用 Markdown，JSON 中转环节整体删除。Rust 服务在**当前用户登录后**由 Windows `HKCU\...\Run` 启动；微信数据和密钥属于当前用户，因此无需以 SYSTEM 身份运行。
 
 ## 程序清单
 
@@ -29,7 +29,7 @@
 
 接入云端命令通道用 `./install.ps1 -CloudUrl <云端基地址> -DeviceId <云端签发的设备 ID> -ProvisionCode <预置码>`；客户网页是云端域名时再加 `-AllowOrigin <域名>`（可重复或逗号分隔）。安装脚本会把云端地址写进 `%LOCALAPPDATA%\AICRM-Windows-API\cloud.url`，隧道地址变了只改这个文件再重启服务，不用重装。
 
-**缺口（安装脚本尚未覆盖）**：`/api/aicrm/collect` 与 `wechat.collect` 要跑 `AICRM-Export.exe`，而 `install.ps1` 只把 `AICRM-Key.exe` 和 Markdown 导出程序复制进 `tools\`。`Service::new` 也只校验 `AICRM-Key.exe` 与 `aicrm-export-new.exe` 这两个（`archive_service` 的 `AICRM-Export.exe` 不在启动校验里），所以缺 `AICRM-Export.exe` 不会让服务启动失败，但采集会在运行时以「辅助程序启动失败」告终 —— 部署时要手动把它放进 `tools\`。
+采集闭环只依赖 `aicrm-export-new.exe`，它由 `install.ps1 -ExportProgram` 复制进 `tools\`，也是 `Service::new` 的启动校验项，缺它服务起不来。不再依赖 `AICRM-Export.exe`。
 
 `./uninstall.ps1` 只删除登录自启项并停止服务，保留程序、密钥、token 和导出文件。手动启动命令可查看 `install.ps1` 写入的 `HKCU:\Software\Microsoft\Windows\CurrentVersion\Run\AICRM-Windows-API` 值。
 
@@ -100,7 +100,7 @@ Start-Process pwsh -ArgumentList '-NoProfile','-File','.\mock-agent-cloud.ps1','
 
 ## 接口
 
-除下面单列的握手端点外，所有接口都要求 `Authorization: Bearer <token>`，token 在 `%LOCALAPPDATA%\AICRM-Windows-API\api.token`。接口层只解析请求、调用 `backend/service/` 的函数。该目录按辅助程序拆分：`service/mod.rs` 是共享底座（服务状态、进程调用、并发闸门、`authorize` 鉴权中间件），`service/key_service.rs` 承载 `AICRM-Key.exe` 业务（密钥准备、账号查询），`service/export_service.rs` 承载 `aicrm-export-new.exe` 业务（Markdown 导出执行、结果打包与 NDJSON），`service/archive_service.rs` 承载 `AICRM-Export.exe` + 归档上传（数据采集闭环上半段），`service/agent_service.rs` 是云端命令通道（长轮询 + 心跳）。
+除下面单列的握手端点外，所有接口都要求 `Authorization: Bearer <token>`，token 在 `%LOCALAPPDATA%\AICRM-Windows-API\api.token`。接口层只解析请求、调用 `backend/service/` 的函数。该目录按辅助程序拆分：`service/mod.rs` 是共享底座（服务状态、进程调用、并发闸门、`authorize` 鉴权中间件），`service/key_service.rs` 承载 `AICRM-Key.exe` 业务（密钥准备、账号查询），`service/export_service.rs` 承载 `aicrm-export-new.exe` 业务（Markdown 导出执行、结果打包与 NDJSON），`service/archive_service.rs` 承载 Markdown 归档打包与上传（数据采集闭环上半段），`service/agent_service.rs` 是云端命令通道（长轮询 + 心跳）。
 
 鉴权不在各模块内单独实现，而是在 `backend/mod.rs` 的 `app()` 里通过唯一的 `route_layer` 统一施加到全部已注册路由上。新增模块只需写一个 `pub fn router() -> Router<Arc<Service>>` 并在 `app()` 中 `merge` 一行，其所有接口自动受保护，无需写任何鉴权代码；所有 `merge` 都必须写在 `route_layer` 之前。用 `route_layer` 而非 `layer`，是为了让未匹配的路径保持 404 而不是变成 401。`backend/mod.rs` 的测试会遍历表里全部 11 个接口，确认无 token、错 token、其它认证方案均返回 401。
 

@@ -35,9 +35,8 @@ const BINARIES: [&str; 3] = [
     "aicrm-login.exe",
     "aicrm-console.exe",
 ];
-const TOOLS: [&str; 4] = [
+const TOOLS: [&str; 3] = [
     "AICRM-Key.exe",
-    "AICRM-Export.exe",
     "aicrm-export-new.exe",
     "使用手册.txt",
 ];

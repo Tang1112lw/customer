@@ -1,40 +1,41 @@
 //! 聊天记录归档与上传。
 //!
-//! 「数据采集」闭环的上半段：客户端把聊天记录导成云端能分析的格式，再上传。
+//! 「数据采集」闭环的上半段：客户端把聊天记录导成 Markdown，打包上传给云端。
 //!
-//! 为什么要跑两个导出程序：
+//! 只跑一个导出程序 `aicrm-export-new.exe`，它产出
+//! `<wxid>/<联系人>/<日期>/messages.md`。云端把这份 Markdown 原样存盘、原样交给
+//! Hermes 智能体分析（AI 输入格式 `aicrm-analysis-input/v3`），全链路一种格式：
+//! 人工阅读用的和 AI 分析用的是同一份数据，不再有 JSON 中转。
 //!
-//! - `AICRM-Export.exe` 产出 `<wxid>/<联系人>/<日期>/messages.json`，字段与云端的
-//!   `aicrm-chat/v1` 完全对齐，是给流水线吃的；
-//! - `aicrm-export-new.exe` 产出同结构的 `messages.md`，是给人看的。
-//!
-//! 两者都要：云端分析用 JSON 归档，人工查阅用 Markdown。
-//!
-//! 归档包格式（云端 `archive.go` 的 `archiveBundle`）：
+//! 归档包格式（云端 `archive.go` 的 `markdownBundle`）：
 //!
 //! ```json
 //! {
-//!   "schema_version": "aicrm-chat-archive/v1",
+//!   "schema_version": "aicrm-chat-archive/v2",
 //!   "task_id": "<uuid>",
 //!   "bootstrap": false,
-//!   "exports": [ { "chat": {...}, "date_range": {...}, "messages": [...] } ]
+//!   "exports": [{
+//!     "chat": {"id": "…", "display_name": "…", "type": "contact"},
+//!     "date_range": {"start": "2026-10-07", "end": "2026-10-09"},
+//!     "days": [{"date": "2026-10-09", "message_count": 12, "markdown": "# 2026-10-09\n\n- **我**：…"}]
+//!   }]
 //! }
 //! ```
 //!
-//! 云端的 `ArchiveUploadedBundle` 也接受**单个** `aicrm-chat/v1` 文档，但上传接口
-//! 只收一个文件，所以多个会话必须合并成一个归档包。
+//! 会话 ID 取导出目录里的会话文件夹名：群聊是 `xxx@chatroom`，单聊是联系人名。
+//! Markdown 里没有消息 ID，云端的分析去重因此按天（`day:YYYY-MM-DD`）记账。
 
 use super::{ApiError, ApiResult, Service, option, state_service::UPLOADED, today};
 use crate::backend::service::run_blocking;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{fs, path::Path, time::Duration};
+use std::{collections::BTreeMap, fs, path::Path, time::Duration};
 
-/// 云端流水线要的导出程序（产 `messages.json`）。
-pub(crate) const ARCHIVE_PROGRAM: &str = "AICRM-Export.exe";
+/// 导出程序：产 `messages.md`，云端归档与 AI 分析都用它。
+pub(crate) const ARCHIVE_PROGRAM: &str = super::export_service::EXPORT_PROGRAM;
 
 /// 归档包 schema 版本，必须与云端 `archive.go` 的 `archiveSchemaVersion` 一致。
-const ARCHIVE_SCHEMA: &str = "aicrm-chat-archive/v1";
+const ARCHIVE_SCHEMA: &str = "aicrm-chat-archive/v2";
 
 /// 导出超时。聊天库大时这个程序会跑很久。
 const ARCHIVE_TIMEOUT: Duration = Duration::from_secs(3600);
@@ -113,19 +114,11 @@ impl Service {
         let _ = fs::remove_dir_all(&work);
         fs::create_dir_all(&work).map_err(|_| ApiError::io())?;
 
-        // ① 两个导出程序都跑：JSON 给流水线，Markdown 给人看。
-        //    先跑 JSON，它失败就没必要再跑 Markdown。
+        // 导出 Markdown：JSON 给流水线、Markdown 给人看的老分工已经取消，
+        // 现在一份 Markdown 同时满足人工查阅与 AI 分析。
         self.run_archive_program(ARCHIVE_PROGRAM, &work, &request)
             .await?;
-        let markdown_program = super::export_service::EXPORT_PROGRAM;
-        if let Err(error) = self
-            .run_archive_program(markdown_program, &work, &request)
-            .await
-        {
-            // Markdown 只是附赠，失败不该让整个采集任务失败。
-            eprintln!("Markdown 导出失败（不影响归档上传）：{}", error.message());
-        }
-        let _ = work; // 两个程序都写进同一目录，JSON 与 Markdown 按会话并排
+        let _ = work; // 导出程序把结果写进 work，云端按会话/日期拆开
 
         // ② 收集所有 messages.json，合并成一个归档包
         let bundle = tokio::task::spawn_blocking({
@@ -182,7 +175,7 @@ impl Service {
         outcome
     }
 
-    /// 跑一个导出程序。两者参数名几乎一样，但 `--output`/`--export-dir` 语义一致。
+    /// 跑导出程序。参数与 `aicrm-export-new.exe` 的命令行一致。
     async fn run_archive_program(
         &self,
         program: &str,
@@ -210,50 +203,132 @@ impl Service {
     }
 }
 
-/// 把目录下所有 `messages.json` 合并成一个 `aicrm-chat-archive/v1` 包。
+/// 把导出目录里的 `messages.md` 合并成一个 `aicrm-chat-archive/v2` 包。
+///
+/// 目录结构由导出程序决定：`<导出目录>/<wxid>/<会话>/<YYYY-MM-DD>/messages.md`。
+/// 会话文件夹名就是会话标识（群聊为 `xxx@chatroom`，单聊为联系人名），云端按它分会话。
 fn build_archive(root: &Path, task_id: &str) -> Result<Value, String> {
-    let mut documents: Vec<Value> = Vec::new();
-    collect_documents(root, &mut documents)?;
-    if documents.is_empty() {
+    // 先定位 wxid 层：优先用任务里的 wxid，否则取导出目录下唯一的子目录。
+    let account_root = locate_account_root(root)?;
+    let mut conversations: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    for entry in
+        fs::read_dir(&account_root).map_err(|error| format!("读取 {} 失败：{error}", account_root.display()))?
+    {
+        let entry = entry.map_err(|error| format!("读取会话目录失败：{error}"))?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(conversation) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        for day_entry in
+            fs::read_dir(&path).map_err(|error| format!("读取 {} 失败：{error}", path.display()))?
+        {
+            let day_entry = day_entry.map_err(|error| format!("读取日期目录失败：{error}"))?;
+            let day_path = day_entry.path();
+            if !day_path.is_dir() {
+                continue;
+            }
+            let Some(date) = day_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| is_iso_date(name))
+            else {
+                continue;
+            };
+            let markdown_path = day_path.join("messages.md");
+            if !markdown_path.is_file() {
+                continue;
+            }
+            let markdown = fs::read_to_string(&markdown_path)
+                .map_err(|error| format!("读取 {} 失败：{error}", markdown_path.display()))?;
+            if markdown.trim().is_empty() {
+                continue;
+            }
+            conversations
+                .entry(conversation.to_string())
+                .or_default()
+                .insert(date.to_string(), markdown);
+        }
+    }
+    if conversations.is_empty() {
         return Err(format!(
-            "导出目录里没有找到任何 messages.json：{}",
-            root.display()
+            "导出目录里没有找到任何 messages.md：{}",
+            account_root.display()
         ));
     }
+
+    let exports: Vec<Value> = conversations
+        .into_iter()
+        .map(|(conversation, days)| {
+            let dates: Vec<String> = days.keys().cloned().collect();
+            let start = dates.first().cloned().unwrap_or_default();
+            let end = dates.last().cloned().unwrap_or_default();
+            let day_values: Vec<Value> = days
+                .into_iter()
+                .map(|(date, markdown)| {
+                    json!({
+                        "date": date,
+                        "message_count": count_markdown_messages(&markdown),
+                        "markdown": markdown,
+                    })
+                })
+                .collect();
+            json!({
+                "chat": {
+                    // Markdown 里没有会话 ID，用文件夹名当 ID；群聊能据 @chatroom 判定类型。
+                    "id": conversation,
+                    "display_name": conversation,
+                    "type": if conversation.ends_with("@chatroom") { "group" } else { "contact" },
+                },
+                "date_range": {"start": start, "end": end},
+                "days": day_values,
+            })
+        })
+        .collect();
+
     Ok(json!({
         "schema_version": ARCHIVE_SCHEMA,
         "task_id": task_id,
         // 增量采集：只提交本次导出的范围，不做全量整理
         "bootstrap": false,
-        "exports": documents,
+        "exports": exports,
     }))
 }
 
-/// 递归收集导出文档。只收 `messages.json`，跳过 `messages.md` 和媒体文件。
-fn collect_documents(dir: &Path, out: &mut Vec<Value>) -> Result<(), String> {
-    let entries =
-        fs::read_dir(dir).map_err(|error| format!("读取 {} 失败：{error}", dir.display()))?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_documents(&path, out)?;
-            continue;
+/// 定位导出目录下的账号层目录。
+fn locate_account_root(root: &Path) -> Result<std::path::PathBuf, String> {
+    let direct = root.join("messages.md");
+    if !direct.is_file() {
+        let entries = fs::read_dir(root)
+            .map_err(|error| format!("读取 {} 失败：{error}", root.display()))?;
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                return Ok(entry.path());
+            }
         }
-        if path.file_name().and_then(|name| name.to_str()) != Some("messages.json") {
-            continue;
-        }
-        let text = fs::read_to_string(&path)
-            .map_err(|error| format!("读取 {} 失败：{error}", path.display()))?;
-        let document: Value = serde_json::from_str(&text)
-            .map_err(|error| format!("{} 不是合法 JSON：{error}", path.display()))?;
-        // 云端要求每个文档有 chat 与 messages；缺了就是导出程序出了岔子，
-        // 宁可当场报错，也不要传一个云端必然拒收的包上去。
-        if document.get("chat").is_none() || document.get("messages").is_none() {
-            return Err(format!("{} 缺少 chat 或 messages 字段", path.display()));
-        }
-        out.push(document);
     }
-    Ok(())
+    Ok(root.to_path_buf())
+}
+
+fn is_iso_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+}
+
+/// 数 Markdown 里的消息行（`- **发言人**：正文`）。与云端 `CountMarkdownMessages` 一致。
+fn count_markdown_messages(markdown: &str) -> usize {
+    markdown
+        .lines()
+        .filter(|line| line.trim_start().starts_with("- "))
+        .count()
 }
 
 /// 以 multipart/form-data 上传归档包。字段名必须是 `file`。

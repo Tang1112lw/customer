@@ -3,7 +3,7 @@
 //! 按辅助程序拆分的业务逻辑位于子模块：
 //! - [`key_service`]：`AICRM-Key.exe`，密钥准备与本地账号查询
 //! - [`export_service`]：`aicrm-export-new.exe`，导出执行（Markdown 输出）
-//! - [`archive_service`]：`AICRM-Export.exe` + 归档上传，数据采集闭环的上半段
+//! - [`archive_service`]：Markdown 归档打包上传，数据采集闭环的上半段
 
 pub mod agent_service;
 pub mod archive_service;
