@@ -418,6 +418,10 @@ struct Snapshot {
     jobs: Vec<Job>,
     /// 已登录的账号名，来自 `account.name`（登录窗口写入）。None = 未登录。
     account: Option<String>,
+    /// 当前账号在本机绑定的微信号，由服务从云端拉取后缓存。None = 还没拉到。
+    bound_wxid: Option<String>,
+    /// 绑定微信号的昵称（云端记录），用于优先显示。
+    bound_name: Option<String>,
 }
 
 /// 侧边栏的两个页面。
@@ -489,6 +493,23 @@ fn snapshot() -> Snapshot {
         .ok()
         .map(|text| text.trim().to_owned())
         .filter(|name| !name.is_empty());
+
+    // 当前账号绑定的微信号：由服务从云端拉取后写在这里。界面只读缓存，不发网络请求。
+    if let Ok(raw) = std::fs::read_to_string(dir.join("data").join("state").join("bound-wechat.json"))
+    {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+            snap.bound_wxid = value
+                .get("wxid")
+                .and_then(|item| item.as_str())
+                .map(str::to_owned)
+                .filter(|item| !item.is_empty());
+            snap.bound_name = value
+                .get("name")
+                .and_then(|item| item.as_str())
+                .map(str::to_owned)
+                .filter(|item| !item.is_empty());
+        }
+    }
 
     if let Ok(entries) = std::fs::read_dir(dir.join("accounts")) {
         for entry in entries.flatten() {
@@ -1234,42 +1255,47 @@ impl Console {
 
 impl Console {
     fn wechat_card(&mut self, ui: &mut egui::Ui, width: f32) {
-        let (color, status) = match (self.snap.accounts.is_empty(), self.snap.credential_ready) {
-            (true, _) => (theme::IDLE, "未绑定"),
-            (false, true) => (theme::OK, "密钥就绪"),
-            (false, false) => (theme::WARN, "缺密钥"),
+        // 只认「**当前登录账号**在本机绑定的那个微信号」。
+        // 本机 accounts 目录里可能躺着别的账号采集过的密钥，拿第一个顶上会让客户
+        // 以为已经绑好了（实测踩过：登录 liang，卡片却显示 test2 的微信号）。
+        let bound = self.snap.bound_wxid.clone();
+        let bound_ready = bound
+            .as_ref()
+            .map(|wxid| self.snap.accounts.iter().any(|item| item == wxid))
+            .unwrap_or(false);
+        let others = self.snap.accounts.len().saturating_sub(usize::from(bound_ready));
+        let (color, status) = match (bound.is_some(), bound_ready) {
+            (false, _) => (theme::IDLE, "未绑定"),
+            (true, true) => (theme::OK, "密钥就绪"),
+            (true, false) => (theme::WARN, "缺密钥"),
         };
-        let accounts = self.snap.accounts.clone();
         theme::card(ui, width, |ui| {
             theme::card_head_rev(ui, "密钥获取", color, status);
             ui.add_space(8.0);
-            match accounts.first() {
+            match bound.as_deref() {
                 // 优先显示微信号（昵称）；没有导出数据时回落到 wxid（密钥目录名）
                 Some(wxid) => {
                     let display = self
                         .snap
-                        .wechat_name
+                        .bound_name
                         .clone()
-                        .unwrap_or_else(|| wxid.clone());
-                    ui.add(
-                        egui::Label::new(theme::value(&display)).truncate(),
-                    );
-                    // 有昵称且与 wxid 不同时，小字补回 wxid；否则维持原说明
-                    let detail = match &self.snap.wechat_name {
-                        Some(name) if name != wxid => wxid.clone(),
-                        _ => {
-                            if accounts.len() > 1 {
-                                format!("本机共 {} 个，采集用第一个", accounts.len())
-                            } else {
-                                "云端设备页会显示同一个账号".to_owned()
-                            }
-                        }
-                    };
-                    ui.label(theme::faint(&detail));
+                        .or_else(|| self.snap.wechat_name.clone())
+                        .unwrap_or_else(|| wxid.to_owned());
+                    ui.add(egui::Label::new(theme::value(&display)).truncate());
+                    if bound_ready {
+                        ui.label(theme::faint(wxid));
+                    } else {
+                        ui.label(theme::faint(&format!("尚未采集 {wxid} 的密钥")));
+                    }
+                    if others > 0 {
+                        ui.label(theme::faint(&format!(
+                            "本机另有 {others} 个其他账号的密钥，当前账号不可用"
+                        )));
+                    }
                 }
                 None => {
-                    ui.label(theme::value("尚无可用密钥"));
-                    ui.label(theme::faint("在云端网页发起「绑定微信」后回到这里"));
+                    ui.label(theme::value("尚未绑定微信号"));
+                    ui.label(theme::faint("在云端网页「绑定微信」后回到这里"));
                 }
             }
             ui.add_space(10.0);

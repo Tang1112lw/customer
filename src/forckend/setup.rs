@@ -201,6 +201,30 @@ fn unpack_payload() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// 装完把自己删掉。
+///
+/// 正在运行的 exe 删不掉自己，交给一个延迟执行的命令：等本进程退出后再删。
+/// 用 ping 当延时 —— 不依赖控制台，也不会像 timeout 那样在被重定向时报错。
+fn remove_self_after_exit() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let script = format!("ping -n 4 127.0.0.1 >nul & del /f /q \"{}\"", exe.display());
+    let mut command = Command::new("cmd.exe");
+    command
+        .args(["/c", &script])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let _ = command.spawn();
+}
+
 /// 装完立刻把主窗口打开 —— 状态一目了然，登录也从那里进。
 /// 主窗口缺席（老版本装的）就退回直接开登录窗。失败不影响安装结果，因此忽略错误。
 fn open_main_window(base_url: &str) {
@@ -428,6 +452,9 @@ impl SetupApp {
                 // 停在一个"安装成功"的静止页面上反而让人以为没生效。
                 // 先把自己的单实例名额放掉 —— 不然客户端一启动就被这把锁挡回去。
                 single::release();
+                // 装完把安装包本身删掉 —— 客户桌面上只该有一个客户端图标，不该堆着
+                // 安装程序，更不该出现"点开说找不到文件"的残留（微信也是这样）。
+                remove_self_after_exit();
                 match open_console() {
                     // 客户端已经出面了，安装窗口就没必要继续占着任务栏 ——
                     // 两个窗口并排摆着，用户会以为装了两遍。

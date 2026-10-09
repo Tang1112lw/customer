@@ -223,15 +223,6 @@ foreach ($shortcutPath in $shortcutTargets) {
     }
 }
 
-# 把规范快捷方式的字节存档：更新器在「没有安装脚本介入」的时候用它重建桌面/开始菜单图标。
-# 直接在 Rust 里写 .lnk 的二进制格式不值得，存一份模板最省事。
-$shortcutArchive = Join-Path $data 'state'
-New-Item -ItemType Directory -Force -Path $shortcutArchive | Out-Null
-$desktopLink = $shortcutTargets[0]
-if (Test-Path -LiteralPath $desktopLink) {
-    Copy-Item -LiteralPath $desktopLink -Destination (Join-Path $shortcutArchive 'shortcut-AICRM客户端.lnk') -Force
-}
-
 # ---- 注册自启并立即启动 ----
 $originArgs = ''
 if ($AllowOrigin) {

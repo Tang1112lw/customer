@@ -182,6 +182,10 @@ pub fn spawn(service: std::sync::Arc<Service>, config: CloudConfig) {
             if let Err(error) = send_heartbeat(&heartbeat_service, &heartbeat_config).await {
                 eprintln!("心跳上报失败：{}", error.message());
             }
+            // 顺手把「当前账号在本机绑定的微信号」拉到本地缓存，供界面展示。
+            if let Err(error) = refresh_bound_wechat(&heartbeat_service, &heartbeat_config).await {
+                eprintln!("读取绑定微信号失败：{}", error.message());
+            }
             tokio::time::sleep(Duration::from_secs(HEARTBEAT_SECONDS)).await;
         }
     });
@@ -915,4 +919,62 @@ fn launch_updater(updater: &Path, install_dir: &Path) -> ApiResult<()> {
 #[cfg(not(windows))]
 fn launch_updater(_updater: &Path, _install_dir: &Path) -> ApiResult<()> {
     Err(ApiError::helper("当前平台不支持自更新"))
+}
+
+/// 拉取「当前登录账号在本机绑定的微信号」，缓存到 `data/state/bound-wechat.json`。
+///
+/// 界面上的「密钥获取」卡片必须按**当前账号**渲染：本机 `accounts` 目录里可能躺着
+/// 别的账号采集过的密钥，直接显示第一个会让客户以为当前账号已经绑好了（实测踩过：
+/// 登录 liang，卡片却显示 test2 的微信号）。
+///
+/// 网络请求放在服务里而不是界面里：界面每帧都刷新快照，在 UI 线程等 HTTP 会卡住界面。
+async fn refresh_bound_wechat(service: &Service, config: &CloudConfig) -> ApiResult<()> {
+    let Some(token) = current_user_token(config) else {
+        return Ok(());
+    };
+    let base = config.base_url().to_owned();
+    let device_id = config.device_id.clone();
+    let state_dir = service.data.join("state");
+
+    blocking(move || {
+        let url = format!("{base}/api/ui/v1/devices");
+        let mut response = agent()
+            .get(&url)
+            .header("Authorization", &format!("Bearer {token}"))
+            .header("Accept", "application/json")
+            .call()
+            .map_err(|error| ApiError::helper(format!("云端不可达：{error}")))?;
+        let text = response
+            .body_mut()
+            .read_to_string()
+            .map_err(|_| ApiError::io())?;
+        let value: Value =
+            serde_json::from_str(&text).map_err(|_| ApiError::helper("设备列表响应不合法"))?;
+        let bound = value
+            .get("data")
+            .and_then(|data| data.get("devices"))
+            .and_then(|list| list.as_array())
+            .and_then(|list| {
+                list.iter().find(|item| {
+                    item.get("id").and_then(|value| value.as_str()) == Some(device_id.as_str())
+                })
+            });
+        let record = json!({
+            "deviceId": device_id,
+            "wxid": bound.and_then(|item| item.get("boundWxid")).and_then(|v| v.as_str()).unwrap_or(""),
+            "name": bound.and_then(|item| item.get("boundName")).and_then(|v| v.as_str()).unwrap_or(""),
+            "at": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_secs())
+                .unwrap_or(0),
+        });
+        std::fs::create_dir_all(&state_dir).map_err(|_| ApiError::io())?;
+        std::fs::write(
+            state_dir.join("bound-wechat.json"),
+            serde_json::to_vec_pretty(&record).unwrap_or_default(),
+        )
+        .map_err(|_| ApiError::io())?;
+        Ok(())
+    })
+    .await
 }
