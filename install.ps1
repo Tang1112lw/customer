@@ -25,7 +25,11 @@
     # 留空则自动判定：开发机用 src\tools，部署包用脚本同级的 tools\。
     [string]$ToolSource = '',
     # Markdown 导出程序。默认在 ToolSource 里找；找不到就报错，不静默降级。
-    [string]$ExportProgram = ''
+    [string]$ExportProgram = '',
+    # 客户端首次「连接云端」时会再调一次本脚本完成配对。那种场景下必须保留
+    # 调用者自己（aicrm-console.exe），否则脚本刚跑就把客户端停掉，
+    # 表现为"点了连接、窗口直接消失"。
+    [switch]$KeepConsole
 )
 
 $ErrorActionPreference = 'Stop'
@@ -91,7 +95,9 @@ if (Test-Path -LiteralPath $manifest) {
 New-Item -ItemType Directory -Force -Path $InstallDir, $tools, $data | Out-Null
 # 覆盖前必须停掉还在跑的旧进程：界面和托盘开着的时候，Copy-Item 会直接撞上
 # "文件正由另一进程使用" 而中断安装。安装器自身不在列表里 —— 停自己会让脚本当场断掉。
-foreach ($name in @('aicrm_windows_api.exe', 'aicrm-console.exe', 'aicrm-login.exe', 'aicrm-tray.exe')) {
+$stopNames = @('aicrm_windows_api.exe', 'aicrm-console.exe', 'aicrm-login.exe', 'aicrm-tray.exe')
+if ($KeepConsole) { $stopNames = $stopNames | Where-Object { $_ -ne 'aicrm-console.exe' } }
+foreach ($name in $stopNames) {
     Get-CimInstance Win32_Process -Filter "Name = '$name'" |
         Where-Object { $_.ExecutablePath -like "$InstallDir*" } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
@@ -101,6 +107,9 @@ Start-Sleep -Seconds 1    # 给系统一点时间把文件句柄放掉
 Copy-Item -LiteralPath $exeSource -Destination $exe -Force
 Copy-Item -LiteralPath $loginSource -Destination $loginExe -Force
 Copy-Item -LiteralPath $consoleSource -Destination $consoleExe -Force
+# 把自己也留一份。客户端首次「连接云端」时会再调一次本脚本完成配对
+# （令牌生成、自启项重写、重启服务都在这里，没必要在 Rust 里重写一遍）。
+Copy-Item -LiteralPath $PSCommandPath -Destination (Join-Path $InstallDir 'install.ps1') -Force
 # 服务启动时会校验 tools 目录里这两个程序存在；名字必须与 service 模块里的常量一致。
 Copy-Item -LiteralPath (Join-Path $ToolSource 'AICRM-Key.exe') -Destination (Join-Path $tools 'AICRM-Key.exe') -Force
 Copy-Item -LiteralPath $ExportProgram -Destination (Join-Path $tools 'aicrm-export-new.exe') -Force
@@ -126,14 +135,20 @@ if ($CloudUrl) {
         [IO.File]::WriteAllText($deviceFile, $cloudDeviceId, [Text.Encoding]::ASCII)
     }
     else {
-        throw '首次接入云端需要 -DeviceId（与 -ProvisionCode 配套，由云端网页端签发时一并给出）'
+        # 还没连云端：先落一个占位 id，真正的设备身份由服务端在客户端首次
+        # 「连接云端」时签发并覆盖。没有 id 的话自启项里就写不进 --device-id，
+        # 服务起来也不会去连云端。
+        $cloudDeviceId = [guid]::NewGuid().ToString()
+        [IO.File]::WriteAllText($deviceFile, $cloudDeviceId, [Text.Encoding]::ASCII)
     }
 
     if (Test-Path -LiteralPath $deviceTokenFile) {
         Write-Output '设备此前已配对，沿用已有设备令牌。'
     }
     elseif (-not $ProvisionCode) {
-        throw '首次接入云端需要 -ProvisionCode（从云端网页端「绑定微信账号」处获取）'
+        # 静默安装时拿不到账号密码，就谈不上申领配对码。跳过这一段，
+        # 设备身份留给客户端首次「连接云端」时去签发。
+        Write-Output '尚未接入云端命令通道：等客户端首次连接云端时自动完成配对。'
     }
     else {
         # 设备令牌在本机生成，云端只保存 SHA-256，不保存明文。

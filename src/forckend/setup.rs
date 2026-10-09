@@ -25,9 +25,8 @@ mod single;
 #[allow(dead_code)]
 mod theme;
 
-use cloud::{LoginError, Session};
+// 静默安装不再需要登录：`cloud` 只用来提示"地址是 http 明文"这件事。
 use eframe::egui;
-use serde::Deserialize;
 use std::{
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -230,80 +229,46 @@ fn open_main_window(base_url: &str) {
         .spawn();
 }
 
-#[derive(Deserialize)]
-struct Envelope<T> {
-    data: Option<T>,
-}
-
-#[derive(Deserialize)]
-struct Provision {
-    #[serde(rename = "deviceId")]
-    device_id: String,
-    #[serde(rename = "provisionCode")]
-    provision_code: String,
-}
-
-/// 用已登录的令牌为本机申领一个配对码。
-fn create_provision(base_url: &str, access_token: &str) -> Result<Provision, String> {
-    let url = format!("{}/api/ui/v1/provisions", base_url.trim_end_matches('/'));
-    let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows".to_owned());
-    let body = serde_json::json!({ "name": name }).to_string();
-
-    let agent: ureq::Agent = ureq::config::Config::builder()
-        .timeout_global(Some(std::time::Duration::from_secs(30)))
-        .http_status_as_error(false)
-        .build()
-        .into();
-    let mut response = agent
-        .post(&url)
-        .header("Authorization", &format!("Bearer {access_token}"))
-        .header("Content-Type", "application/json")
-        .send(body.as_str())
-        .map_err(|error| format!("无法连接云端：{error}"))?;
-
-    let status = response.status();
-    let text = response
-        .body_mut()
-        .read_to_string()
-        .map_err(|error| format!("读取响应失败：{error}"))?;
-    if !status.is_success() {
-        return Err(format!(
-            "云端拒绝签发配对码（HTTP {status}）。账号需要有管理员权限：{text}"
-        ));
-    }
-    let envelope: Envelope<Provision> =
-        serde_json::from_str(&text).map_err(|_| "云端返回格式不符合预期".to_owned())?;
-    envelope
-        .data
-        .ok_or_else(|| "云端没有返回配对信息".to_owned())
-}
-
 /// 调用载荷里的 install.ps1 完成落盘、注册自启与启动服务。
 ///
 /// 复用安装脚本而不是在 Rust 里重写一遍：拷贝文件、icacls 收紧权限、写 HKCU Run
 /// 这些逻辑已经在那边验证过了，重复实现只会多一处会走样的地方。
-fn run_installer(base_url: &str, provision: &Provision, work: &Path) -> Result<String, String> {
+/// 调随包的 `install.ps1` 落盘。
+///
+/// `provision` 为 `None` 表示**静默安装**：拿不到账号密码就申领不了配对码，
+/// 设备身份留给客户端首次「连接云端」时去签发（install.ps1 会先落一个占位 id）。
+fn run_installer(
+    base_url: &str,
+    provision: Option<&cloud::Provision>,
+    work: &Path,
+) -> Result<String, String> {
     let script = work.join("install.ps1");
     if !script.is_file() {
         return Err("安装载荷里缺少 install.ps1".to_owned());
     }
     let base = base_url.trim_end_matches('/');
 
-    let output = Command::new("powershell")
+    let mut command = Command::new("powershell");
+    command
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
         .arg(&script)
         .arg("-CloudUrl")
         .arg(base)
-        .arg("-DeviceId")
-        .arg(&provision.device_id)
-        .arg("-ProvisionCode")
-        .arg(&provision.provision_code)
         .arg("-Endpoint")
         .arg(format!("{base}/api/auth/login"))
         // 网页来源白名单：云端网页和接口是同一个基地址，所以直接用它。
         // 不带这一项的话，装完网页端拿不到本机令牌，「数据采集」按钮点不动。
         .arg("-AllowOrigin")
-        .arg(base)
+        .arg(base);
+    if let Some(provision) = provision {
+        command
+            .arg("-DeviceId")
+            .arg(&provision.device_id)
+            .arg("-ProvisionCode")
+            .arg(&provision.provision_code);
+    }
+
+    let output = command
         .output()
         .map_err(|error| format!("无法运行安装脚本：{error}"))?;
 
@@ -368,9 +333,8 @@ enum State {
 }
 
 struct SetupApp {
+    /// 打包时预填的云端地址。不再由用户输入 —— 客户装个软件不该被问这个。
     endpoint: String,
-    username: String,
-    password: String,
     state: State,
     pending: Option<Receiver<Result<String, String>>>,
     /// 「打开客户端」的结果，失败时直接说清楚原因，别让用户猜。
@@ -381,8 +345,6 @@ impl SetupApp {
     fn new(endpoint: String) -> Self {
         Self {
             endpoint,
-            username: String::new(),
-            password: String::new(),
             state: State::Idle,
             pending: None,
             hint: None,
@@ -409,32 +371,28 @@ impl SetupApp {
             .to_owned()
     }
 
+    /// 静默安装：不问账号密码。
+    ///
+    /// 装的是什么（放文件 + 注册自启）和"我是谁"（设备配对）是两件事。以前揉在
+    /// 一个表单里，客户装个软件还得先要账号密码 —— 现在只做前者，配对交给客户端
+    /// 首次打开时的「连接云端」引导页。
     fn start(&mut self, ctx: &egui::Context) {
         if self.busy() {
             return;
         }
         let base = self.base_url();
-        if base.is_empty() || self.username.trim().is_empty() || self.password.is_empty() {
-            self.state = State::Failed("请填写云端地址、账号和密码".to_owned());
+        if base.is_empty() {
+            self.state = State::Failed("打包时未填入云端地址".to_owned());
             return;
         }
 
         let (sender, receiver) = mpsc::channel();
-        let endpoint = format!("{base}/api/auth/login");
-        let username = self.username.trim().to_owned();
-        let password = std::mem::take(&mut self.password);
         let ctx = ctx.clone();
 
         std::thread::spawn(move || {
             let outcome = (|| -> Result<String, String> {
-                // ① 登录
-                let session: Session = cloud::login(&endpoint, &username, &password, "setup")
-                    .map_err(|error| match error {
-                        LoginError::Rejected(message) => format!("账号或密码错误：{message}"),
-                        other => other.message().to_owned(),
-                    })?;
-                // ② 取出随包的程序与脚本：优先用内嵌载荷（单文件安装程序），
-                //    没有载荷就退回"和本 exe 同目录"的旧布局（开发机手工分发用）。
+                // 取出随包的程序与脚本：优先用内嵌载荷（单文件安装程序），
+                // 没有载荷就退回"和本 exe 同目录"的旧布局（开发机手工分发用）。
                 let work = match unpack_payload() {
                     Ok(dir) => dir,
                     Err(_) => std::env::current_exe()
@@ -443,16 +401,11 @@ impl SetupApp {
                         .map(Path::to_path_buf)
                         .ok_or_else(|| "安装包路径异常".to_owned())?,
                 };
-                // ③ 为本机申领配对码（用户全程看不到它）
-                let provision = create_provision(&base, &session.access_token)?;
-                // ④ 交给安装脚本落盘
-                let log = run_installer(&base, &provision, &work)?;
+                let log = run_installer(&base, None, &work)?;
                 let _ = std::fs::remove_dir_all(&work);
-                // ⑤ 装完直接把主窗口打开，客户不用去文件夹里找
-                open_main_window(&base);
                 Ok(format!(
-                    "安装完成\n\n设备 ID：{}\n\n{log}",
-                    provision.device_id
+                    "{log}\n\n下一步：客户端打开后会请你连一次云端，\
+                     连上就完成配对，以后不用再填。"
                 ))
             })();
             let _ = sender.send(outcome);
@@ -460,7 +413,7 @@ impl SetupApp {
         });
 
         self.pending = Some(receiver);
-        self.state = State::Working("正在登录云端…".to_owned());
+        self.state = State::Working("正在安装…".to_owned());
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
@@ -533,6 +486,10 @@ impl SetupApp {
 
 impl eframe::App for SetupApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 不问任何东西，打开就开始装。安装器已经没有需要用户填的内容了。
+        if matches!(self.state, State::Idle) {
+            self.start(ctx);
+        }
         let before = std::mem::discriminant(&self.state);
         self.poll(ctx);
         // 与登录窗口同理：状态变了必须再要一帧，否则界面不刷新
@@ -544,89 +501,41 @@ impl eframe::App for SetupApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| {
-            let width = ui.available_width();
 
             ui.add_space(4.0);
             ui.label(egui::RichText::new("AICRM 客户端安装").size(17.0).strong());
             ui.add_space(4.0);
             ui.label(theme::muted(
-                "填入云端地址与账号，安装程序会自动完成设备配对、写入开机自启。",
+                "正在安装，完成后会自动打开客户端。不需要填任何东西。",
             ));
-            ui.add_space(18.0);
+            ui.add_space(24.0);
 
-            let enabled = !self.busy() && !self.finished();
-            let card_width = (width - theme::PAD * 2.0).max(280.0);
-            theme::card(ui, card_width, |ui| {
-                ui.label(theme::muted("云端地址"));
-                ui.add_space(5.0);
-                ui.add_enabled(
-                    enabled,
-                    egui::TextEdit::singleline(&mut self.endpoint)
-                        .hint_text("http://你的云端地址")
-                        .desired_width(f32::INFINITY),
-                );
-
-                ui.add_space(15.0);
-                ui.label(theme::muted("账号"));
-                ui.add_space(5.0);
-                ui.add_enabled(
-                    enabled,
-                    egui::TextEdit::singleline(&mut self.username)
-                        .hint_text("用于配对的账号")
-                        .desired_width(f32::INFINITY),
-                );
-
-                ui.add_space(15.0);
-                ui.label(theme::muted("密码"));
-                ui.add_space(5.0);
-                ui.add_enabled(
-                    enabled,
-                    egui::TextEdit::singleline(&mut self.password)
-                        .password(true)
-                        .desired_width(f32::INFINITY),
-                );
-            });
-
-            ui.add_space(16.0);
-            let mut submit = false;
-            ui.horizontal(|ui| {
-                if self.finished() {
-                    // 装完之后按钮换成收尾动作 —— 否则用户只能一直盯着「安装中…」，
-                    // 既不知道已经装完了，也找不到客户端在哪。
-                    if theme::primary_button(ui, "打开客户端").clicked() {
-                        self.hint = open_console().err();
-                    }
-                    if theme::ghost_button(ui, "完成").clicked() {
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                } else if self.busy() {
-                    let _ = theme::primary_button(ui, "安装中…");
-                } else {
-                    if theme::primary_button(ui, "开始安装").clicked() {
-                        submit = true;
-                    }
-                    if theme::ghost_button(ui, "退出").clicked() {
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                }
-            });
-
-            ui.add_space(18.0);
             self.status_ui(ui);
 
             if let Some(hint) = &self.hint {
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 ui.label(egui::RichText::new(hint).size(12.0).color(theme::BAD));
             }
 
-            if let Some(warning) = cloud::transport_warning(&self.endpoint) {
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(warning).size(12.0).color(theme::WARN));
+            // 只有失败才给按钮。成功路径上不该出现需要用户点的东西 ——
+            // 装完会自动拉起客户端并关掉自己。
+            if matches!(self.state, State::Failed(_)) {
+                ui.add_space(20.0);
+                ui.horizontal(|ui| {
+                    if theme::primary_button(ui, "重试").clicked() {
+                        let ctx = ui.ctx().clone();
+                        self.state = State::Idle;
+                        self.start(&ctx);
+                    }
+                    if theme::ghost_button(ui, "关闭").clicked() {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
             }
 
-            if submit {
-                let ctx = ui.ctx().clone();
-                self.start(&ctx);
+            if let Some(warning) = cloud::transport_warning(&self.endpoint) {
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new(warning).size(12.0).color(theme::WARN));
             }
         });
     }

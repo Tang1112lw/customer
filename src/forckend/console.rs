@@ -23,6 +23,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod cloud;
 mod shell;
 mod single;
 mod theme;
@@ -33,7 +34,7 @@ use std::{
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{mpsc, Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -265,6 +266,72 @@ fn stop_service() {
 ///
 /// 没有用互斥量：托盘每次点击都会拉起一次程序，开出一串窗口是必然的事故，
 /// 这个检查足够挡住，而且不引入额外的依赖。
+/// 连接云端：登录 → 申领配对码 → 交给 install.ps1 完成配对。
+///
+/// 配对这一步复用安装脚本而不是在 Rust 里重写：令牌生成（`New-HexToken`）、
+/// 收紧文件权限、**重写开机自启项里的 `--device-id`**、重启服务 —— 这些都在那边
+/// 验证过了。漏掉"重写自启项"这一条，下次开机就会用回旧身份、恒定 401。
+fn connect_task(base: &str, username: &str, password: &str) -> Result<String, String> {
+    let session = cloud::login(&format!("{base}/api/auth/login"), username, password, "console")
+        .map_err(|error| error.message().to_owned())?;
+    let provision = cloud::create_provision(base, &session.access_token)?;
+
+    let script = install_dir().join("install.ps1");
+    if !script.is_file() {
+        return Err("找不到安装脚本，无法完成配对。请重新运行安装程序。".to_owned());
+    }
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .arg("-CloudUrl")
+        .arg(base)
+        .arg("-DeviceId")
+        .arg(&provision.device_id)
+        .arg("-ProvisionCode")
+        .arg(&provision.provision_code)
+        .arg("-Endpoint")
+        .arg(format!("{base}/api/auth/login"))
+        .arg("-AllowOrigin")
+        .arg(base)
+        // 别让脚本把调用它的我们停掉（脚本默认会停 console 以便覆盖文件）。
+        .arg("-KeepConsole")
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("无法运行安装脚本：{error}"))?;
+
+    if output.status.success() {
+        Ok(format!(
+            "已连接云端，设备 {}。以后打开直接进主界面。",
+            provision.device_id
+        ))
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        Err(if stderr.is_empty() { stdout } else { stderr })
+    }
+}
+
+/// 这台机器是否已经和云端配过对。
+///
+/// 判据是 `device.token` 在不在 —— 它是设备身份的凭据，没有它服务上报会被云端
+/// 直接拒（401），所以首次打开必须先把它办下来。
+fn paired() -> bool {
+    let path = install_dir().join("device.token");
+    std::fs::read_to_string(&path)
+        .map(|text| text.trim().len() >= 32)
+        .unwrap_or(false)
+}
+
+/// 云端基地址：装的时候写进 `cloud.url`，改服务器只改这个文件。
+fn cloud_base() -> String {
+    let url = read_trimmed(&install_dir().join("cloud.url"));
+    if url.is_empty() {
+        "http://127.0.0.1:8081".to_owned()
+    } else {
+        url.trim_end_matches('/').to_owned()
+    }
+}
+
 fn service_up() -> bool {
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8765);
     TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok()
@@ -345,6 +412,30 @@ enum Page {
     #[default]
     Main,
     Config,
+    /// 首次打开、还没和云端配对过时的引导页。配对完成后就不再出现。
+    Connect,
+}
+
+/// 连接引导页的状态。配对是网络操作，必须放后台线程，否则界面会卡死。
+struct Connect {
+    username: String,
+    password: String,
+    /// 正在进行：非空表示忙碌，界面锁输入
+    step: Option<String>,
+    error: Option<String>,
+    pending: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+}
+
+impl Default for Connect {
+    fn default() -> Self {
+        Self {
+            username: String::new(),
+            password: String::new(),
+            step: None,
+            error: None,
+            pending: None,
+        }
+    }
 }
 
 #[derive(Default, Clone)]
@@ -507,6 +598,8 @@ struct Console {
     page: Page,
     /// 右上角账号菜单是否展开
     account_menu: bool,
+    /// 连接引导页的表单与后台任务。只在未配对时用得到。
+    connect: Connect,
 }
 
 impl Console {
@@ -524,8 +617,11 @@ impl Console {
             visible,
             // 默认托管：打开窗口就等于"服务该在跑"，掉了自动拉回来。
             auto_service: true,
-            page: Page::default(),
+            // 没配对过就先引导连接：设备身份是与云端通信的前提，
+            // 少了它服务起来也只会一直 401。
+            page: if paired() { Page::Main } else { Page::Connect },
             account_menu: false,
+            connect: Connect::default(),
         }
     }
 
@@ -533,6 +629,51 @@ impl Console {
         self.snap = snapshot();
         self.refreshed = Some(Instant::now());
         self.keep_service_alive();
+    }
+
+    /// 开始连接：后台跑登录 → 申领配对码 → 交给安装脚本完成配对。
+    fn start_connect(&mut self, ctx: &egui::Context) {
+        if self.connect.step.is_some() {
+            return;
+        }
+        if self.connect.username.trim().is_empty() || self.connect.password.is_empty() {
+            self.connect.error = Some("请填写账号和密码".to_owned());
+            return;
+        }
+        let base = cloud_base();
+        let username = self.connect.username.trim().to_owned();
+        let password = std::mem::take(&mut self.connect.password);
+        let (sender, receiver) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(connect_task(&base, &username, &password));
+            ctx.request_repaint();
+        });
+        self.connect.pending = Some(receiver);
+        self.connect.step = Some("正在连接云端…".to_owned());
+        self.connect.error = None;
+    }
+
+    /// 收后台连接任务的结果。
+    fn poll_connect(&mut self) {
+        let Some(receiver) = &self.connect.pending else {
+            return;
+        };
+        let outcome = match receiver.try_recv() {
+            Ok(outcome) => outcome,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Err("连接线程异常退出".to_owned()),
+        };
+        self.connect.pending = None;
+        self.connect.step = None;
+        match outcome {
+            Ok(message) => {
+                self.page = Page::Main;
+                self.note = Some(message);
+                self.refresh();
+            }
+            Err(message) => self.connect.error = Some(message),
+        }
     }
 
     /// 托管本地服务：没在跑就拉起来，跑着就什么都不做。
@@ -623,6 +764,8 @@ impl eframe::App for Console {
         if self.refreshed.is_none_or(|last| last.elapsed() >= REFRESH) {
             self.refresh();
         }
+        // 收后台连接任务的结果：不轮询的话连上了界面也不会跳进主界面
+        self.poll_connect();
 
         // 托盘惰性创建：事件循环没起来之前建不出来
         if self.tray.is_none() && !self.tray_failed {
@@ -630,6 +773,9 @@ impl eframe::App for Console {
                 Ok(tray) => self.tray = Some(tray),
                 Err(error) => {
                     self.tray_failed = true;
+                    // 同时写 stderr：托盘建不出来时界面上那行提示很容易被忽略，
+                    // 而它直接导致"点 × 就是退出、没有托盘可回"。
+                    eprintln!("托盘创建失败：{error}");
                     self.note = Some(format!("托盘创建失败：{error}"));
                 }
             }
@@ -675,6 +821,12 @@ impl eframe::App for Console {
         egui::Frame::NONE.fill(theme::CONTENT).show(ui, |ui| {
             ui.set_width(width);
             ui.set_height(height);
+            // 还没连上云端时不画侧边栏：那会儿"主界面 / 配置"两个入口都没有意义，
+            // 摆出来只会让人以为已经能用了。连接引导页自己占满整宽。
+            if self.page == Page::Connect {
+                self.connect_page(ui);
+                return;
+            }
             ui.horizontal_top(|ui| {
                 self.sidebar(ui, height);
                 self.content(ui, height);
@@ -731,6 +883,8 @@ impl Console {
                     match self.page {
                         Page::Main => self.main_page(ui),
                         Page::Config => self.config_page(ui),
+                        // 连接引导在主内容区里也要能画：它跟主界面共用顶栏
+                        Page::Connect => self.connect_page(ui),
                     }
                 });
         });
@@ -868,6 +1022,71 @@ impl Console {
                         self.refresh();
                     }
                 });
+            });
+        });
+    }
+
+    /// 连接引导页：还没和云端配对过时才出现。
+    ///
+    /// 独立于主界面，不显示侧边栏 —— 这会儿"主界面/配置"都还没有意义，
+    /// 连不上什么都是空的。
+    fn connect_page(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(46.0);
+            ui.label(egui::RichText::new("连接云端").size(18.0).strong());
+        });
+        ui.add_space(26.0);
+
+        let busy = self.connect.step.is_some();
+        let width = (ui.available_width() - theme::PAD * 2.0).min(420.0);
+        ui.horizontal(|ui| {
+            ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
+            theme::card(ui, width, |ui| {
+                ui.label(theme::muted("云端地址"));
+                ui.add_space(5.0);
+                let mut base = cloud_base();
+                ui.add_enabled(
+                    false,
+                    egui::TextEdit::singleline(&mut base).desired_width(f32::INFINITY),
+                );
+
+                ui.add_space(15.0);
+                ui.label(theme::muted("账号"));
+                ui.add_space(5.0);
+                ui.add_enabled(
+                    !busy,
+                    egui::TextEdit::singleline(&mut self.connect.username)
+                        .hint_text("网页端用的同一个账号")
+                        .desired_width(f32::INFINITY),
+                );
+
+                ui.add_space(15.0);
+                ui.label(theme::muted("密码"));
+                ui.add_space(5.0);
+                let _ = ui.add_enabled(
+                    !busy,
+                    egui::TextEdit::singleline(&mut self.connect.password)
+                        .password(true)
+                        .desired_width(f32::INFINITY),
+                );
+
+                ui.add_space(18.0);
+                if busy {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(theme::muted(
+                            self.connect.step.as_deref().unwrap_or("正在连接…"),
+                        ));
+                    });
+                } else if theme::primary_button(ui, "连接").clicked() {
+                    let ctx = ui.ctx().clone();
+                    self.start_connect(&ctx);
+                }
+
+                if let Some(error) = &self.connect.error {
+                    ui.add_space(12.0);
+                    ui.label(egui::RichText::new(error).size(12.0).color(theme::BAD));
+                }
             });
         });
     }

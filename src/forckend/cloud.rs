@@ -205,3 +205,101 @@ pub fn transport_warning(endpoint: &str) -> Option<String> {
     }
     Some("警告：该地址不是 HTTPS，密码会以明文经过网络".to_owned())
 }
+
+/// 云端签发的设备预置授权：设备 ID 与配对码成对出现。
+#[derive(Deserialize)]
+pub struct Provision {
+    #[serde(rename = "deviceId")]
+    pub device_id: String,
+    #[serde(rename = "provisionCode")]
+    pub provision_code: String,
+}
+
+/// 用已登录的令牌为本机申领一个配对码。
+///
+/// 该接口要求管理员权限 —— 这正是过去"装个客户端还得先要账号密码"的根因。
+/// 现在配对挪到客户端首次打开时的连接引导页，由使用者填一次，装的时候一个字都不问。
+pub fn create_provision(base_url: &str, access_token: &str) -> Result<Provision, String> {
+    let url = format!("{}/api/ui/v1/provisions", base_url.trim_end_matches('/'));
+    let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows".to_owned());
+    let body = serde_json::json!({ "name": name }).to_string();
+
+    let agent: ureq::Agent = ureq::config::Config::builder()
+        .timeout_global(Some(Duration::from_secs(30)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut response = agent
+        .post(&url)
+        .header("Authorization", &format!("Bearer {access_token}"))
+        .header("Content-Type", "application/json")
+        .send(body.as_str())
+        .map_err(|error| format!("无法连接云端：{error}"))?;
+
+    let status = response.status();
+    let text = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|error| format!("读取响应失败：{error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "云端拒绝签发配对码（HTTP {status}）。这个账号需要有管理员权限：{text}"
+        ));
+    }
+    let envelope: Envelope<Provision> =
+        serde_json::from_str(&text).map_err(|_| "云端返回格式不符合预期".to_owned())?;
+    envelope
+        .data
+        .ok_or_else(|| "云端没有返回配对信息".to_owned())
+}
+
+/// 用配对码换设备身份。
+///
+/// 令牌在**本机**生成，云端只保存它的 SHA-256 —— 所以明文从不经过网络，
+/// 装完之后也只在本地盘上有一份（权限已收紧）。
+pub fn pair_device(
+    base_url: &str,
+    provision: &Provision,
+    device_token: &str,
+) -> Result<(), String> {
+    let url = format!("{}/api/agent/v1/provision", base_url.trim_end_matches('/'));
+    let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows".to_owned());
+    let body = serde_json::json!({
+        "deviceId": provision.device_id,
+        "code": provision.provision_code,
+        "deviceToken": device_token,
+        "name": name,
+    })
+    .to_string();
+
+    let agent: ureq::Agent = ureq::config::Config::builder()
+        .timeout_global(Some(Duration::from_secs(30)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut response = agent
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .send(body.as_str())
+        .map_err(|error| format!("无法连接云端：{error}"))?;
+
+    let status = response.status();
+    let text = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|error| format!("读取响应失败：{error}"))?;
+    if !status.is_success() {
+        return Err(format!("配对失败（HTTP {status}）：{text}"));
+    }
+    let decoded: serde_json::Value =
+        serde_json::from_str(&text).map_err(|_| "云端返回格式不符合预期".to_owned())?;
+    let done = decoded
+        .pointer("/data/provisioned")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if done {
+        Ok(())
+    } else {
+        Err("云端未确认配对".to_owned())
+    }
+}
