@@ -53,7 +53,11 @@
 //!
 //! 三种也都保留着同名的本地 HTTP 接口，两条路径复用同一批 `Service` 方法。
 
-use std::{path::Path, time::Duration};
+use std::{
+    path::Path,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -62,6 +66,47 @@ use super::{ApiError, ApiResult, ArchiveRequest, ExportRequest, PrepareRequest, 
 
 /// 长轮询的挂起秒数。云端允许 5..=60；取中间值，兼顾实时性与连接数。
 const POLL_WAIT_SECONDS: u64 = 25;
+
+/// 正在执行的「重活」数量：采集、导出、上传，以及命令本身。
+///
+/// 自更新要等它归零才能动手 —— 导出跑到一半把进程杀掉就是产品事故。
+/// 轮询是串行的，但浏览器可以直接打本机 `/api/aicrm/collect`，那条路是后台任务，
+/// 不走轮询，所以必须用计数而不是简单状态位。
+static ACTIVE_JOBS: AtomicUsize = AtomicUsize::new(0);
+
+/// 重活的作用域守卫。作用域结束自动减一，异常路径也不会漏减。
+pub(crate) struct JobGuard;
+
+impl JobGuard {
+    pub(crate) fn new() -> Self {
+        ACTIVE_JOBS.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        ACTIVE_JOBS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn jobs_active() -> bool {
+    ACTIVE_JOBS.load(Ordering::SeqCst) > 0
+}
+
+/// 自动应用的等待上限。超过就放弃这一轮，留给「下次启动」那条路。
+const AUTO_APPLY_WAIT: Duration = Duration::from_secs(30 * 60);
+
+/// 空闲之后再多等一会儿再动手：命令回执（重装后的版本号靠它上报）得先发出去。
+const AUTO_APPLY_GRACE: Duration = Duration::from_secs(15);
+
+/// 登录令牌（access token）自动续期的检查间隔。
+///
+/// 令牌只有 2 小时。一过期，客户端就**拿不到任何云端数据**：心跳里随附的登录令牌
+/// 会被拒（设备归属不再跟着登录账号走），界面上"当前账号绑定的微信号"也取不回来
+/// —— 密钥卡片会显示成"尚未绑定微信号"，客户以为绑定丢了（实测就是这么被问的）。
+/// 这里提前换新的，客户什么都不用管。
+const TOKEN_REFRESH_SECONDS: u64 = 30 * 60;
 
 /// 心跳间隔。云端 `OFFLINE_AFTER` 默认 45 秒，超时即判设备离线、网页端不允许下发任务。
 /// 取 20 秒留出抖动余量。
@@ -173,6 +218,40 @@ pub fn spawn(service: std::sync::Arc<Service>, config: CloudConfig) {
         startup.state.cleanup_jobs(&startup.data.join("jobs"));
     });
 
+    // 启动自检：每次启动（含自更新之后的那次重启）都核对一遍本机密钥，
+    // 并把结论写进本地状态文件，供界面显示「已绑定 微信号 xxx」。
+    //
+    // 用 `prepare --no-restart` 是刻意的：它只**检查**密钥是否可用，不会去重启微信
+    // 重抓一遍 —— 重抓是客户能感知的动作，只在客户自己点「绑定」时才做。
+    let keys_service = service.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        loop {
+            match keys_service.verify_local_key().await {
+                Ok(Some((wxid, name))) => eprintln!("本机密钥核对通过：已绑定 {name}（{wxid}）"),
+                Ok(None) => eprintln!("本机密钥核对：{}", keys_service.key_state_summary()),
+                Err(error) => eprintln!("本机密钥核对失败：{}", error.message()),
+            }
+            // 客户可能在运行期间才把微信登录上、或换了账号，所以是复查。
+            tokio::time::sleep(Duration::from_secs(10 * 60)).await;
+        }
+    });
+
+    // 登录令牌续期：access token 只有 2 小时，过期后会话登记与"当前账号绑定的微信号"
+    // 全部失效（界面显示成"尚未绑定"）。每 30 分钟提前换一对新令牌，客户无感。
+    let refresh_config = config.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        loop {
+            match refresh_user_token(&refresh_config).await {
+                Ok(true) => eprintln!("登录令牌已自动续期"),
+                Ok(false) => {}
+                Err(error) => eprintln!("登录令牌续期失败：{}", error.message()),
+            }
+            tokio::time::sleep(Duration::from_secs(TOKEN_REFRESH_SECONDS)).await;
+        }
+    });
+
     let heartbeat_service = service.clone();
     let heartbeat_config = config.clone();
     tokio::spawn(async move {
@@ -204,7 +283,7 @@ pub fn spawn(service: std::sync::Arc<Service>, config: CloudConfig) {
 }
 
 /// 本机微信是否在运行。用 tasklist 而不是引第三方库 —— 心跳每 20 秒一次，开销可接受。
-fn wechat_process_running() -> bool {
+pub(crate) fn wechat_process_running() -> bool {
     // 老版是 WeChat.exe，4.x 改成 Weixin.exe，两个都认
     ["WeChat.exe", "Weixin.exe"].iter().any(|name| {
         std::process::Command::new("tasklist")
@@ -289,19 +368,18 @@ impl WeChatProbe {
             database_present: false,
             credential_ready: false,
         };
-        if let Ok(entries) = std::fs::read_dir(&service.keys) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if !name.starts_with("wxid_") || !entry.path().is_dir() {
-                    continue;
-                }
-                probe.wxid = name;
-                probe.account_present = true;
-                probe.credential_ready = entry.path().join("credentials.local.json").is_file();
-                // cache 是密钥程序解密出来的数据库缓存，有它说明库也读得到
-                probe.database_present = entry.path().join("cache").is_dir();
-                break;
-            }
+        // 取「最近抓到的那一个」账号：换过微信账号的机器，密钥目录下会同时
+        // 躺着旧号的目录，按枚举顺序拿第一个会一直上报旧号 —— 实测踩过：
+        // 客户换号重绑成功后心跳仍报旧号，网页端因此显示「未关联客户端」。
+        if let Some(name) = super::newest_account_dir(&service.keys) {
+            let path = service.keys.join(&name);
+            probe.wxid = name.clone();
+            probe.account_present = true;
+            probe.credential_ready = path.join("credentials.local.json").is_file();
+            // cache 是密钥程序解密出来的数据库缓存，有它说明库也读得到。
+            // 位置是 **key-dir/cache/**（见 config.json 的 decrypted_dir），
+            // 不是 wxid 子目录下 —— 查错路径会把已经就绪的机器判成未就绪。
+            probe.database_present = super::decrypted_cache_ready(&service.keys, &name);
         }
         if probe.account_present {
             // 昵称翻导出目录才能拿到，而心跳每 20 秒一次 —— 先查缓存，
@@ -405,6 +483,67 @@ async fn send_heartbeat(service: &Service, config: &CloudConfig) -> ApiResult<()
     .await
 }
 
+/// 用刷新令牌换一对新令牌，并写回磁盘。返回 true 表示确实换到了。
+///
+/// 只在本地存有 `api.refresh` 时才动：没登录过的机器（只有安装时生成的本地令牌）
+/// 直接跳过。刷新令牌本身也有 7 天有效期，换不到就静默返回 false —— 该让客户
+/// 重新登录，而不是把日志刷满。
+async fn refresh_user_token(config: &CloudConfig) -> ApiResult<bool> {
+    let Some(token_file) = config.user_token_file.clone() else {
+        return Ok(false);
+    };
+    let refresh_file = token_file.with_file_name("api.refresh");
+    let Ok(raw) = std::fs::read_to_string(&refresh_file) else {
+        return Ok(false);
+    };
+    let refresh = raw.trim().to_owned();
+    if refresh.is_empty() {
+        return Ok(false);
+    }
+    let base = config.base_url();
+    let payload = json!({ "refreshToken": refresh }).to_string();
+    let body = blocking(move || {
+        let url = format!("{base}/api/auth/refresh");
+        let mut response = agent()
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .send(payload.as_str())
+            .map_err(|error| ApiError::helper(format!("云端不可达：{error}")))?;
+        response
+            .body_mut()
+            .read_to_string()
+            .map_err(|_| ApiError::io())
+    })
+    .await?;
+
+    let value: Value =
+        serde_json::from_str(&body).map_err(|_| ApiError::helper("续期响应不符合契约"))?;
+    let Some(data) = value.get("data") else {
+        return Ok(false);
+    };
+    let access = data
+        .get("accessToken")
+        .and_then(|item| item.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    let next = data
+        .get("refreshToken")
+        .and_then(|item| item.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    if access.is_empty() {
+        return Ok(false);
+    }
+    std::fs::write(&token_file, access).map_err(|_| ApiError::io())?;
+    if !next.is_empty() {
+        // 刷新令牌是轮换的：不写回，下一次续期就会拿旧的换不到。
+        let _ = std::fs::write(&refresh_file, next);
+    }
+    Ok(true)
+}
+
 /// 现读本机登录令牌（api.token）。文件缺失或为空表示这台机器还没登录过。
 fn current_user_token(config: &CloudConfig) -> Option<String> {
     let path = config.user_token_file.as_ref()?;
@@ -438,6 +577,20 @@ fn agent() -> ureq::Agent {
     ureq::config::Config::builder()
         .timeout_global(Some(Duration::from_secs(POLL_WAIT_SECONDS + 20)))
         // 自己判状态码，才能把云端的错误消息读出来
+        .http_status_as_error(false)
+        .build()
+        .into()
+}
+
+/// 下载程序包专用的 HTTP 客户端：给足时间。
+///
+/// 默认 [`agent`] 的全局超时只有 45 秒（为长轮询设的），而整包里的界面程序
+/// 接近 10 MB —— 客户那边网速稍慢就超时，回报 `读取 aicrm-console.exe 失败：
+/// timeout: global`，整次更新失败（实测：真机卡在 0.1.38 就是这么来的）。
+/// 这里单独放宽到 10 分钟；下载本身不会挂太久，网络断了也会立刻报错。
+fn download_agent() -> ureq::Agent {
+    ureq::config::Config::builder()
+        .timeout_global(Some(Duration::from_secs(600)))
         .http_status_as_error(false)
         .build()
         .into()
@@ -493,6 +646,8 @@ fn decode<T: serde::de::DeserializeOwned>(command: &Command) -> Result<T, Report
 
 /// 执行命令。任何失败都转成回传结果，绝不中断轮询。
 async fn execute(service: &Service, config: &CloudConfig, command: &Command) -> Report {
+    // 整条命令都算「重活」：自更新要等所有重活结束才动手重启客户端。
+    let _job = JobGuard::new();
     match command.kind.as_str() {
         // 取密钥。注意：密钥缺失时辅助程序**可能重启微信**，云端只应在确认客户在场时下发。
         "wechat.bind" => match decode::<PrepareRequest>(command) {
@@ -841,11 +996,44 @@ struct UpdateRequest {
     #[serde(default)]
     name: String,
     /// 期望的 SHA-256（小写十六进制）。
+    #[serde(default)]
     sha256: String,
     /// 字节数，只用于日志与界面提示。
     #[serde(default)]
     size: i64,
+    /// 整包清单：一次更新要把安装目录里的多个程序一起换掉。
+    ///
+    /// 只带 `sha256`/`name` 一个文件的旧载荷仍然认（老云端 / 老清单），
+    /// 那时退化成「只换服务端 exe」。
+    #[serde(default)]
+    parts: Vec<UpdatePart>,
 }
+
+/// 整包里的一个部件。`target` 是**安装目录里的目标文件名** —— 发布产物名
+/// （如 agent-0.1.34.exe）只是给下载用的，绝不能拿它当替换目标。
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+struct UpdatePart {
+    #[serde(default)]
+    kind: String,
+    /// 发布产物名，只用于日志。
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    target: String,
+    #[serde(default)]
+    sha256: String,
+    #[serde(default)]
+    size: i64,
+}
+
+/// 自更新允许替换的安装目录文件。与更新器 `ALLOWED_TARGETS` 对齐，
+/// 但不含 `aicrm-update.exe`：更新器自己要活到替换完成，换不了自己。
+const UPDATE_TARGETS: [&str; 3] = [
+    "aicrm_windows_api.exe",
+    "aicrm-console.exe",
+    "aicrm-login.exe",
+];
 
 impl Service {
     /// 客户端自更新：下载 → 校验 → 落盘 → 交接给外部脚本替换重启。
@@ -863,57 +1051,90 @@ impl Service {
         if version.is_empty() {
             return Err(ApiError::helper("更新版本号为空"));
         }
-        let kind = if request.kind.trim().is_empty() {
-            "agent".to_owned()
-        } else {
-            request.kind.trim().to_owned()
-        };
-        // 只接受 agent：key / export 是辅助程序，替换它们各自还有落地路径要处理。
-        if kind != "agent" {
-            return Err(ApiError::helper(format!("不支持的更新类型：{kind}")));
-        }
-        // 目标文件名固定：安装目录里 agent 恒为 aicrm_windows_api.exe。
-        // 云端清单里的 name 是**发布产物名**（如 agent-0.1.4.exe），拿它当替换目标
-        // 会往安装目录里多写一个文件、而真正要换的程序根本没动 —— 实测踩过这个坑。
-        let file_name = "aicrm_windows_api.exe".to_owned();
-        let artifact_name = request.name.trim().to_owned();
         let updater = install_dir.join("aicrm-update.exe");
         if !updater.is_file() {
             return Err(ApiError::helper("安装目录缺少 aicrm-update.exe，无法完成自更新"));
         }
 
+        // 整包优先：云端新清单会把「服务端 + 界面 + 登录程序」一起给过来。
+        // 界面程序不换，客户看到的版本号就永远停在装机那一刻 —— 服务端升了、
+        // 界面还是旧的，客户以为"没更新"（实测就是这么被误判的）。
+        // 只带单个 agent 的旧载荷退化成单文件，行为与从前一致。
+        let mut plan: Vec<(String, String, String)> = Vec::new();
+        for part in &request.parts {
+            let kind = part.kind.trim().to_owned();
+            let target = part.target.trim().to_owned();
+            if !UPDATE_TARGETS.contains(&target.as_str()) {
+                return Err(ApiError::helper(format!(
+                    "更新包里的目标程序不被允许：{target}"
+                )));
+            }
+            if kind.is_empty() {
+                return Err(ApiError::helper(format!("更新包缺少程序类型：{target}")));
+            }
+            plan.push((kind, target, part.sha256.trim().to_lowercase()));
+        }
+        if plan.is_empty() {
+            let kind = request.kind.trim();
+            // 只接受 agent：key / export 是辅助程序，替换它们各自还有落地路径要处理。
+            if !kind.is_empty() && kind != "agent" {
+                return Err(ApiError::helper(format!("不支持的更新类型：{kind}")));
+            }
+            // 目标文件名固定：安装目录里 agent 恒为 aicrm_windows_api.exe。
+            // 云端清单里的 name 是**发布产物名**（如 agent-0.1.4.exe），拿它当替换目标
+            // 会往安装目录里多写一个文件、而真正要换的程序根本没动 —— 实测踩过这个坑。
+            plan.push((
+                if kind.is_empty() {
+                    "agent".to_owned()
+                } else {
+                    kind.to_owned()
+                },
+                "aicrm_windows_api.exe".to_owned(),
+                request.sha256.trim().to_lowercase(),
+            ));
+        }
+        let targets: Vec<String> = plan.iter().map(|(_, target, _)| target.clone()).collect();
+
         // 幂等：同一个版本已经下载并校验过就直接回「已就绪」，别重复拉几 MB。
-        // 云端在冷却后会重复下发，这里挡掉多余流量。
-        if let Some(ready) = staged_ready(&install_dir, &version, &file_name) {
+        // 云端在冷却后会重复下发，这里挡掉多余流量。标记只在**全部部件**都落盘后
+        // 才写，所以这里只看版本号即可。
+        if let Some(ready) = staged_ready(&install_dir, &version) {
+            // 标记还在，说明这一份还没被应用（应用时会消费掉它）。再催一次自动应用，
+            // 免得已经就绪的更新被晾在那里等人工重启。
+            spawn_auto_apply(install_dir.clone(), version.clone());
             return Ok(ready);
         }
 
-        let url = format!("{}/api/agent/v1/programs/{kind}", config.base_url());
-        let expected = request.sha256.trim().to_lowercase();
         let device_token = config.device_token.clone();
         let device_id = config.device_id.clone();
+        let base = config.base_url();
         let stage_dir = install_dir.join("updates").join(&version);
-        // 闭包要拿走所有权，下面写 pending.json 还要用同一个名字，先复制一份。
-        let staged_name = file_name.clone();
-
-        let (size, digest) = blocking(move || {
+        let staged = blocking(move || {
             std::fs::create_dir_all(&stage_dir).map_err(|_| ApiError::io())?;
-            let response = agent()
-                .get(&url)
-                .header("Authorization", &format!("Device {device_token}"))
-                .header("X-AICRM-Device-ID", &device_id)
-                .call()
-                .map_err(|error| ApiError::helper(format!("下载更新包失败：{error}")))?;
-            let bytes = response
-                .into_body()
-                .read_to_vec()
-                .map_err(|error| ApiError::helper(format!("读取更新包失败：{error}")))?;
-            let digest = crate::backend::sha256::hex_digest(&bytes);
-            if !expected.is_empty() && digest != expected {
-                return Err(ApiError::helper("更新包校验失败，已丢弃"));
+            let mut written: Vec<(String, String, i64)> = Vec::new();
+            for (kind, target, expected) in &plan {
+                let url = format!("{base}/api/agent/v1/programs/{kind}");
+                // 用下载专用的客户端：默认那个全局超时只有 45 秒，装不下近 10 MB 的
+                // 界面程序（实测：本机每次都卡在 "读取 aicrm-console.exe 失败：
+                // timeout: global"，整包更新永远走不完）。
+                let response = download_agent()
+                    .get(&url)
+                    .header("Authorization", &format!("Device {device_token}"))
+                    .header("X-AICRM-Device-ID", &device_id)
+                    .call()
+                    .map_err(|error| ApiError::helper(format!("下载 {target} 失败：{error}")))?;
+                let bytes = response
+                    .into_body()
+                    .read_to_vec()
+                    .map_err(|error| ApiError::helper(format!("读取 {target} 失败：{error}")))?;
+                let digest = crate::backend::sha256::hex_digest(&bytes);
+                if !expected.is_empty() && digest != *expected {
+                    return Err(ApiError::helper(format!("{target} 校验失败，已丢弃")));
+                }
+                std::fs::write(stage_dir.join(target), &bytes).map_err(|_| ApiError::io())?;
+                written.push((target.clone(), digest, bytes.len() as i64));
             }
-            std::fs::write(stage_dir.join(&staged_name), &bytes).map_err(|_| ApiError::io())?;
-            Ok((bytes.len(), digest))
+            Ok(written)
         })
         .await?;
 
@@ -921,10 +1142,30 @@ impl Service {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|value| value.as_secs())
             .unwrap_or(0);
+        // 只允许「升级」写入标记。云端换版本比客户端下载快的时候，两条命令可能
+        // 前后脚落地，后到的那条若是旧版本，会把更新的那个标记覆盖掉 ——
+        // 客户重启后反而装上旧版本。
+        if let Some(existing) = super::pending_update_version(&install_dir)
+            && !super::newer_version(&version, &existing)
+        {
+            return Ok(json!({
+                "staged": true,
+                "version": existing,
+                "size": staged.iter().map(|(_, _, size)| *size).sum::<i64>(),
+                "targets": targets,
+                "from": env!("CARGO_PKG_VERSION"),
+                "message": "本机已就绪一个不低于该版本的更新，保持原样",
+            }));
+        }
+        let files: Vec<Value> = staged
+            .iter()
+            .map(|(name, digest, size)| json!({ "name": name, "sha256": digest, "size": size }))
+            .collect();
+        let total: i64 = staged.iter().map(|(_, _, size)| *size).sum();
         let pending = json!({
             "version": version,
-            "kind": kind,
-            "files": [{ "name": file_name, "sha256": digest, "size": size }],
+            "kind": "agent",
+            "files": files,
             "requestedAt": requested_at,
         });
         std::fs::write(
@@ -933,19 +1174,51 @@ impl Service {
         )
         .map_err(|_| ApiError::io())?;
 
-        // 到此为止，**不重启**。微信/QQ 都是「新版本就绪 → 下次启动应用」：
-        // 采集可能正在跑，正用着的时候把进程杀掉是产品事故。
-        // 真正的替换在下次启动时由 main() 交给 aicrm-update.exe 完成。
+        // 就绪之后主动应用：把「客户自己去关掉再打开程序」这一步去掉 ——
+        // 那是人工动作，不是产品能力。微信/QQ 都是下完就自己重启换上。
+        // 这里有且只有一个进程在做重活（见 ACTIVE_JOBS），等到空闲再动手，
+        // 所以不会打断正在跑的采集；万一一直忙，就退回「下次启动应用」那条路。
+        spawn_auto_apply(install_dir.clone(), version.clone());
+
         Ok(json!({
             "staged": true,
             "version": version,
-            "size": size,
-            "artifact": artifact_name,
-            "declaredSize": request.size,
+            "size": total,
+            "targets": targets,
             "from": env!("CARGO_PKG_VERSION"),
-            "message": "新版本已下载并校验完成，将在下次启动时自动应用",
+            "message": "新版本已下载并校验完成，稍后自动重启应用",
         }))
     }
+}
+
+/// 等本机空闲后拉起更新器，把「已就绪」的版本真正换上。
+///
+/// 不在这里直接换：正在运行的 exe 覆盖不了自己，替换必须由独立进程完成
+/// （[`launch_updater`]），而那个进程一旦启动就会杀掉本进程 —— 所以必须先
+/// 确认没有采集/导出在跑，并且把命令回执发出去。
+fn spawn_auto_apply(install_dir: std::path::PathBuf, version: String) {
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + AUTO_APPLY_WAIT;
+        while jobs_active() {
+            if std::time::Instant::now() >= deadline {
+                eprintln!(
+                    "新版本 {version} 已就绪，但本机持续有采集/导出在跑，留给下次启动应用"
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(5));
+        }
+        std::thread::sleep(AUTO_APPLY_GRACE);
+        let updater = install_dir.join("aicrm-update.exe");
+        if !updater.is_file() {
+            eprintln!("新版本 {version} 已就绪，但安装目录缺少 aicrm-update.exe");
+            return;
+        }
+        match launch_updater(&updater, &install_dir) {
+            Ok(()) => eprintln!("新版本 {version} 已就绪，交给更新器重启客户端"),
+            Err(error) => eprintln!("拉起更新器失败：{}", error.message()),
+        }
+    });
 }
 
 /// 拉起更新器并立即返回：它必须活过本进程，才能真正覆盖正在运行的 exe。
@@ -1024,11 +1297,27 @@ async fn refresh_bound_wechat(service: &Service, config: &CloudConfig) -> ApiRes
             "deviceId": device_id,
             "wxid": bound.and_then(|item| item.get("boundWxid")).and_then(|v| v.as_str()).unwrap_or(""),
             "name": bound.and_then(|item| item.get("boundName")).and_then(|v| v.as_str()).unwrap_or(""),
+            "source": "cloud",
             "at": std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|value| value.as_secs())
                 .unwrap_or(0),
         });
+        // 云端这条记录为空时**不要覆盖**本机核对出来的结论：本机密钥是可用的时候，
+        // 界面该显示「已绑定 微信号 xxx」，而不是因为云端没登记就变成「未绑定」。
+        // （本机核对走 `Service::verify_local_key`，它写的是 source=local。）
+        if record["wxid"].as_str().unwrap_or("").is_empty()
+            && let Ok(raw) = std::fs::read_to_string(state_dir.join("bound-wechat.json"))
+            && let Ok(existing) = serde_json::from_str::<Value>(&raw)
+            && existing.get("source").and_then(|item| item.as_str()) == Some("local")
+            && !existing
+                .get("wxid")
+                .and_then(|item| item.as_str())
+                .unwrap_or("")
+                .is_empty()
+        {
+            return Ok(());
+        }
         std::fs::create_dir_all(&state_dir).map_err(|_| ApiError::io())?;
         std::fs::write(
             state_dir.join("bound-wechat.json"),
@@ -1041,7 +1330,10 @@ async fn refresh_bound_wechat(service: &Service, config: &CloudConfig) -> ApiRes
 }
 
 /// 判断某个版本是否已经下载并校验过。已就绪就返回回执，免得重复下载。
-fn staged_ready(install_dir: &Path, version: &str, file_name: &str) -> Option<Value> {
+///
+/// 只看版本号：`pending.json` 是在**整包所有部件**都落盘之后才写的，
+/// 标记在 = 这一版就是齐的。
+fn staged_ready(install_dir: &Path, version: &str) -> Option<Value> {
     let updates = install_dir.join("updates");
     let pending = updates.join("pending.json");
     let raw = std::fs::read_to_string(&pending).ok()?;
@@ -1049,15 +1341,10 @@ fn staged_ready(install_dir: &Path, version: &str, file_name: &str) -> Option<Va
     if value.get("version").and_then(|item| item.as_str()) != Some(version) {
         return None;
     }
-    let staged = updates.join(version).join(file_name);
-    if !staged.is_file() {
-        return None;
-    }
     Some(json!({
         "staged": true,
         "version": version,
-        "size": std::fs::metadata(&staged).map(|item| item.len()).unwrap_or(0),
         "from": env!("CARGO_PKG_VERSION"),
-        "message": "该版本此前已下载完成，将在下次启动时自动应用",
+        "message": "该版本此前已下载完成，等待应用",
     }))
 }

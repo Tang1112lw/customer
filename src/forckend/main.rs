@@ -216,10 +216,22 @@ impl LoginApp {
                     let _ = store::save_account(&store::default_account_file(), name);
                 }
                 match store::save_token(&self.config.token_file, &session.access_token) {
-                    Ok(warning) => State::Succeeded {
-                        display_name: session.display_name,
-                        warning,
-                    },
+                    Ok(warning) => {
+                        // 刷新令牌一并落盘：access token 只有 2 小时，服务靠它自动续期。
+                        // 不存的话，两小时后心跳里的会话登记就开始被拒、界面上"当前账号
+                        // 绑定的微信号"也取不回来（卡片显示成"尚未绑定"）。
+                        if let Some(refresh) = session.refresh_token.as_deref() {
+                            let path = self
+                                .config
+                                .token_file
+                                .with_file_name("api.refresh");
+                            let _ = store::save_token(&path, refresh);
+                        }
+                        State::Succeeded {
+                            display_name: session.display_name,
+                            warning,
+                        }
+                    }
                     Err(error) => State::Failed(format!("令牌写入失败：{error}")),
                 }
             }

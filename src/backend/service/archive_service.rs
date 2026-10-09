@@ -85,10 +85,15 @@ impl Service {
         // 说明密钥没抓全 —— 微信进程在跑、却读不到库）。
         let probe = crate::backend::service::agent_service::WeChatProbe::detect(self);
         if !probe.online() {
-            return Err(ApiError::bad(format!(
+            // 前置检查失败**也要回报云端**：否则任务会僵在「进行中」，
+            // 同一账号 15 分钟内再也发不出新采集（唯一 running 约束）——
+            // 实测踩过：微信没开时点采集，秒回失败但任务一直挂着。
+            let message = format!(
                 "本机微信未就绪：{}。请先打开并登录微信，再重新绑定以获取密钥。",
                 probe.reason()
-            )));
+            );
+            report_task_failure(&request, &message);
+            return Err(ApiError::bad(message));
         }
         // 幂等：这个任务已经传成功过就直接复用结果。
         // 云端正常不会重发同一个 task_id，但客户端崩溃重启、命令重复投递时会；
@@ -144,19 +149,29 @@ impl Service {
 
         // 导出 Markdown：JSON 给流水线、Markdown 给人看的老分工已经取消，
         // 现在一份 Markdown 同时满足人工查阅与 AI 分析。
-        self.run_archive_program(ARCHIVE_PROGRAM, &work, &request)
-            .await?;
+        // 导出失败同样要回报云端（理由见上面的前置检查）。
+        if let Err(error) = self.run_archive_program(ARCHIVE_PROGRAM, &work, &request).await {
+            report_task_failure(&request, &error.message());
+            return Err(error);
+        }
         let _ = work; // 导出程序把结果写进 work，云端按会话/日期拆开
 
         // ② 收集所有 messages.json，合并成一个归档包
+        // 归档打包失败同样回报（理由见上面的前置检查）。
         let bundle = tokio::task::spawn_blocking({
             let root = work.clone();
             let task_id = request.task_id.clone();
             move || build_archive(&root, &task_id)
         })
         .await
-        .map_err(|_| ApiError::io())?
-        .map_err(|message| ApiError::helper(message))?;
+        .map_err(|_| {
+            report_task_failure(&request, "归档打包线程异常结束");
+            ApiError::io()
+        })?
+        .map_err(|message| {
+            report_task_failure(&request, &message);
+            ApiError::helper(message)
+        })?;
 
         let conversation_count = bundle
             .get("exports")

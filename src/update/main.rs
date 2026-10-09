@@ -190,11 +190,11 @@ fn apply(options: &Options) -> Result<(), String> {
             std::fs::copy(&target, backup.join(name))
                 .map_err(|error| format!("备份 {name} 失败：{error}"))?;
         }
-        if let Err(error) = std::fs::copy(source, &target) {
+        if let Err(error) = copy_with_retry(source, &target, name) {
             // 换到一半失败：先把已替换的还原，别留个半新半旧的安装目录
             let _ = rollback(&options.install_dir, &backup, &replaced);
             let _ = start_clients(options);
-            return Err(format!("替换 {name} 失败：{error}"));
+            return Err(error);
         }
         replaced.push(name.clone());
     }
@@ -215,14 +215,72 @@ fn apply(options: &Options) -> Result<(), String> {
     Ok(())
 }
 
-/// 停掉正在运行的客户端。正在运行的 exe 无法被覆盖，这一步不能省。
+/// 停掉正在运行的客户端，并**确认它们真的退出了**才返回。
+///
+/// 两个坑都踩过：
+///   ① 先杀服务、后杀界面 —— 界面（aicrm-console）看守着本地服务，服务刚被杀
+///      它立刻又把服务拉起来，接着覆盖 exe 就撞上「另一个程序正在使用此文件」，
+///      整次更新白跑。所以**先杀看守者（界面/托盘），最后杀服务**。
+///   ② 只杀一次、只睡 1 秒也不够：进程退出与文件句柄释放之间有延迟（杀软扫描、
+///      系统索引都会拖住）。这里循环"杀→查→再杀"，直到确认干净（最多 15 秒）。
 fn stop_clients() {
-    for name in CLIENT_PROGRAMS {
-        let _ = Command::new("taskkill")
-            .args(["/F", "/IM", name])
-            .output();
+    // 顺序：看守者在前，被看守的服务在最后。
+    const ORDER: [&str; 4] = [
+        "aicrm-console.exe",
+        "aicrm-tray.exe",
+        "aicrm-login.exe",
+        "aicrm_windows_api.exe",
+    ];
+    for _ in 0..15 {
+        let mut alive = false;
+        for name in ORDER {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/IM", name])
+                .output();
+        }
+        for name in ORDER {
+            if process_running(name) {
+                alive = true;
+            }
+        }
+        if !alive {
+            // 句柄释放还要一点点时间，给系统一个缓冲
+            std::thread::sleep(Duration::from_millis(500));
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(1));
     }
-    std::thread::sleep(Duration::from_secs(1));
+}
+
+/// 进程是否还在跑。按镜像名查，和停止用的口径一致。
+fn process_running(name: &str) -> bool {
+    Command::new("tasklist")
+        .args(["/FI", &format!("IMAGENAME eq {name}"), "/NH"])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).contains(name))
+        .unwrap_or(false)
+}
+
+/// 覆盖文件，遇到"文件正在使用"重试几次（每次都重新停一遍客户端）。
+///
+/// 客户机上文件句柄的释放不由我们控制：杀软扫描、Explorer 预览、系统索引都
+/// 可能多按住几百毫秒。重试比"一次失败就整次更新作废"划算得多 ——
+/// 那会让客户停在一个半新半旧的版本上，还要等下一轮更新。
+fn copy_with_retry(source: &Path, target: &Path, name: &str) -> Result<(), String> {
+    let mut last = String::new();
+    for attempt in 0..12 {
+        match std::fs::copy(source, target) {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                last = error.to_string();
+                if attempt < 11 {
+                    stop_clients();
+                    std::thread::sleep(Duration::from_millis(800));
+                }
+            }
+        }
+    }
+    Err(format!("替换 {name} 失败：{last}"))
 }
 
 /// 按主进程启动时记下的命令行原样重启服务。

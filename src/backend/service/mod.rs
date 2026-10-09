@@ -97,21 +97,44 @@ impl Service {
         &self.token
     }
 
-    /// 机主微信 wxid：密钥目录下第一个 `wxid_` 开头的子目录名。
+    /// 机主微信 wxid：密钥目录下**最近一次抓到**的那个账号。
     ///
     /// 水位线必须按**机主**账号记。归档包里的 `chat.id` 是会话对方的，
     /// 拿它当自己会让水位线记到别人头上。
     pub(crate) fn self_wxid(&self) -> String {
-        let Ok(entries) = fs::read_dir(&self.keys) else {
-            return String::new();
-        };
-        entries
-            .flatten()
-            .filter(|entry| entry.path().is_dir())
-            .map(|entry| entry.file_name().to_string_lossy().to_string())
-            .find(|name| name.starts_with("wxid_"))
-            .unwrap_or_default()
+        newest_account_dir(&self.keys).unwrap_or_default()
     }
+}
+
+/// 选「本机当前的微信号目录」：取**最近一次完成抓取**的那一个。
+///
+/// 一台机器换过微信账号时，密钥目录下会同时留着旧号的目录；按枚举顺序
+/// 取第一个会一直拿到旧号 —— 实测踩过：换号并重新绑定成功后，心跳、
+/// 控制台、复用判断全都还指着旧号，网页显示「未关联客户端」「尚未绑定微信」。
+/// 密钥程序每次抓取都会重写该账号目录里的 config.json，用它的落盘时间排序
+/// 就能稳定取到当前登录的号。
+pub(crate) fn newest_account_dir(keys: &Path) -> Option<String> {
+    let entries = fs::read_dir(keys).ok()?;
+    let mut newest: Option<(String, std::time::SystemTime)> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        if !name.starts_with("wxid_") || !path.is_dir() {
+            continue;
+        }
+        // 抓取时间：优先 config.json 的落盘时间（抓取时重写），退而取目录时间。
+        let stamp = fs::metadata(path.join("config.json"))
+            .and_then(|meta| meta.modified())
+            .or_else(|_| fs::metadata(&path).and_then(|meta| meta.modified()))
+            .ok();
+        let Some(stamp) = stamp else {
+            continue;
+        };
+        if newest.as_ref().map(|(_, best)| stamp > *best).unwrap_or(true) {
+            newest = Some((name, stamp));
+        }
+    }
+    newest.map(|(name, _)| name)
 }
 
 impl Service {
@@ -134,6 +157,8 @@ impl Service {
         // 记下自己的启动命令：自更新后由 aicrm-update.exe 原样重放。
         // 重拼一遍服务参数只会引入"拼错就采不到数据"的风险。
         record_startup_command(&data);
+        // 界面程序靠这个文件显示"服务实际在跑的版本"。
+        record_service_version(&data);
         let state = state_service::State::new(data.join("state"))?;
         let token = fs::read_to_string(token_file)?.trim().to_owned();
         if token.len() < 32 || !token.bytes().all(|b| b.is_ascii_graphic()) {
@@ -324,6 +349,32 @@ pub(crate) fn today() -> String {
     rfc3339(seconds + 8 * 3600)[..10].to_owned()
 }
 
+/// 解密缓存（聊天数据库）是否已经生成。
+///
+/// **路径必须是 `<key-dir>/cache/`**。AICRM-Key.exe 抓完密钥后把解密出来的库放在
+/// 这里，文件名是库路径的哈希（如 `451f45d20f33427e.db`），账号目录里的
+/// `config.json` 写得明明白白：`"decrypted_dir": "cache"`，相对 key-dir 解析。
+///
+/// 之前只查 `<key-dir>/<wxid>/cache/` —— 那个目录从来不存在，于是**明明已经解密好
+/// 的机器被一直判成「未找到本地数据库」**：云端 online 恒为 false、采集任务一条都
+/// 下发不出去，界面还显示"密钥不完整"。老布局（wxid 子目录下）也一并认。
+pub(crate) fn decrypted_cache_ready(keys: &Path, wxid: &str) -> bool {
+    let candidates = [keys.join("cache"), keys.join(wxid).join("cache")];
+    candidates.iter().any(|dir| has_db_file(dir))
+}
+
+fn has_db_file(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("db"))
+    })
+}
+
 /// 把本次的启动命令行写进 `<data>/state/startup.json`。
 ///
 /// 自更新时主进程会被杀掉，重新拉起需要与服务完全一致的参数（密钥目录、数据目录、
@@ -344,6 +395,24 @@ pub(crate) fn record_startup_command(data: &Path) {
     }
     let _ = fs::write(
         directory.join("startup.json"),
+        serde_json::to_vec_pretty(&payload).unwrap_or_default(),
+    );
+}
+
+/// 把自己的版本号写进 `<data>/state/version.json`，供界面程序读取。
+///
+/// 界面（aicrm-console.exe）是**独立程序**，它右下角显示的版本原本取自自己的
+/// 编译期常量 —— 而自更新历史上只替换服务端 exe，界面程序根本没被换过，
+/// 于是"升完级版本号还是旧的"（实测被当成更新失败）。版本号只有一个真相源：
+/// 正在跑的这份服务。界面读这个文件，就不再自己骗自己。
+pub(crate) fn record_service_version(data: &Path) {
+    let directory = data.join("state");
+    if fs::create_dir_all(&directory).is_err() {
+        return;
+    }
+    let payload = serde_json::json!({ "version": env!("CARGO_PKG_VERSION") });
+    let _ = fs::write(
+        directory.join("version.json"),
         serde_json::to_vec_pretty(&payload).unwrap_or_default(),
     );
 }

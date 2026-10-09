@@ -40,6 +40,7 @@ pub fn router() -> Router<Arc<Service>> {
             "/api/aicrm/prepare",
             post(
                 |State(s): State<Arc<Service>>, Json(r): Json<PrepareRequest>| async move {
+                    let _job = super::service::agent_service::JobGuard::new();
                     s.prepare(r).await.map(Json)
                 },
             ),
@@ -48,6 +49,7 @@ pub fn router() -> Router<Arc<Service>> {
             "/api/aicrm/export",
             post(
                 |State(s): State<Arc<Service>>, Json(r): Json<ExportRequest>| async move {
+                    let _job = super::service::agent_service::JobGuard::new();
                     s.export_files(r).await.map(Json)
                 },
             ),
@@ -64,6 +66,7 @@ pub fn router() -> Router<Arc<Service>> {
             "/api/aicrm/export/bundle",
             post(
                 |State(s): State<Arc<Service>>, Json(r): Json<ExportRequest>| async move {
+                    let _job = super::service::agent_service::JobGuard::new();
                     s.export_bundle(r, false).await
                 },
             ),
@@ -72,6 +75,7 @@ pub fn router() -> Router<Arc<Service>> {
             "/api/aicrm/export/ai-bundle",
             post(
                 |State(s): State<Arc<Service>>, Json(r): Json<ExportRequest>| async move {
+                    let _job = super::service::agent_service::JobGuard::new();
                     s.export_bundle(r, true).await
                 },
             ),
@@ -89,6 +93,8 @@ pub fn router() -> Router<Arc<Service>> {
                     let task_id = r.task_id.clone();
                     let reported = task_id.clone();
                     tokio::spawn(async move {
+                        // 采集是「重活」：自更新要等它结束才重启客户端，否则归档会写一半。
+                        let _job = super::service::agent_service::JobGuard::new();
                         match s.export_and_upload(r).await {
                             Ok(_) => eprintln!("采集任务 {task_id} 已完成并上传"),
                             Err(error) => {

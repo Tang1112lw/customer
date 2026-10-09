@@ -425,6 +425,8 @@ struct Snapshot {
     bound_wxid: Option<String>,
     /// 绑定微信号的昵称（云端记录），用于优先显示。
     bound_name: Option<String>,
+    /// 正在跑的服务版本。界面右下角显示它 —— 见 [`snapshot`]。
+    service_version: Option<String>,
 }
 
 /// 侧边栏的两个页面。
@@ -466,8 +468,29 @@ struct Job {
     modified: Option<SystemTime>,
 }
 
-fn snapshot() -> Snapshot {
-    let dir = install_dir();
+/// 解密缓存（聊天数据库）是否已经生成。
+///
+/// 位置是 `<安装目录>/accounts/cache/*.db` —— 见账号目录里的 config.json：
+/// `"decrypted_dir": "cache"`，相对密钥目录解析。（老布局在 wxid 子目录下，一并认。）
+///
+/// 服务端那份同源实现在 `backend::service::decrypted_cache_ready`；界面是独立程序
+/// （不挂 backend 模块），所以这里保留一份等价实现。改的时候两边都要改。
+fn decrypted_cache_ready(accounts: &std::path::Path, wxid: &str) -> bool {
+    [accounts.join("cache"), accounts.join(wxid).join("cache")]
+        .iter()
+        .any(|dir| {
+            std::fs::read_dir(dir).is_ok_and(|entries| {
+                entries.flatten().any(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("db"))
+                })
+            })
+        })
+}
+
+fn snapshot() -> Snapshot {    let dir = install_dir();
     let mut snap = Snapshot {
         service_up: service_up(),
         ..Default::default()
@@ -497,6 +520,22 @@ fn snapshot() -> Snapshot {
         .map(|text| text.trim().to_owned())
         .filter(|name| !name.is_empty());
 
+    // 服务版本：由服务启动时写进 data/state/version.json。
+    //
+    // 界面**不能**显示自己的 `CARGO_PKG_VERSION`：自更新换的是服务端程序，
+    // 界面程序没被换过，于是"升完级版本号还是旧的"，看起来就像更新失败。
+    // 版本号只有一个真相源 —— 正在跑的这份服务。
+    if let Ok(raw) = std::fs::read_to_string(dir.join("data").join("state").join("version.json"))
+    {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+            snap.service_version = value
+                .get("version")
+                .and_then(|item| item.as_str())
+                .map(str::to_owned)
+                .filter(|item| !item.is_empty());
+        }
+    }
+
     // 当前账号绑定的微信号：由服务从云端拉取后写在这里。界面只读缓存，不发网络请求。
     if let Ok(raw) = std::fs::read_to_string(dir.join("data").join("state").join("bound-wechat.json"))
     {
@@ -523,8 +562,12 @@ fn snapshot() -> Snapshot {
                 //   cache/                 —— 用它解密出来的聊天数据库
                 // 只有密钥没有 cache 时，导出程序读不到聊天库会一直空等
                 // （实测卡到云端 15 分钟超时），界面却写着「密钥就绪」。
+                //
+                // 缓存的真实位置是 **key-dir/cache/**（见账号目录的 config.json：
+                // `"decrypted_dir": "cache"`，相对 key-dir 解析），不是 wxid 子目录下。
+                // 查错路径会把已经就绪的机器显示成「密钥不完整」。
                 let has_credential = entry.path().join("credentials.local.json").is_file();
-                let has_cache = entry.path().join("cache").is_dir();
+                let has_cache = decrypted_cache_ready(&dir.join("accounts"), &name);
                 if has_credential {
                     snap.credential_ready = true;
                 }
@@ -938,9 +981,16 @@ impl Console {
                         Page::Connect => self.connect_page(ui),
                     }
                     // 版本号放窗口内右下角：对外只叫 AICRM，版本信息在程序内部可见。
+                    // 显示的是**服务实际在跑的版本**（服务不在时才回落到界面自己的），
+                    // 否则自更新换掉服务端之后，这里会一直显示界面程序的旧版本号。
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
                         ui.add_space(4.0);
-                        ui.label(theme::faint(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+                        let version = self
+                            .snap
+                            .service_version
+                            .clone()
+                            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
+                        ui.label(theme::faint(&format!("v{version}")));
                     });
                 });
         });
@@ -1285,12 +1335,22 @@ impl Console {
             .as_ref()
             .map(|wxid| self.snap.accounts.iter().any(|item| item == wxid))
             .unwrap_or(false);
-        let others = self.snap.accounts.len().saturating_sub(usize::from(bound_ready));
+        // 云端没登记时，**不要**直接写"尚未绑定微信号" —— 那会让客户以为本机没有密钥，
+        // 而实际上 accounts/ 里可能躺着能用的密钥（实测：本机导出能跑通 14 条消息，
+        // 卡片却写"尚未绑定"）。如实分开说：本机有没有密钥是一回事，
+        // 云端有没有把这个微信号登记到这台电脑是另一回事。
+        let local_only = if bound.is_none() {
+            self.snap.accounts_ready.first().cloned()
+        } else {
+            None
+        };
         let (color, status) = match (bound.is_some(), bound_ready, bound_has_credential) {
-            (false, _, _) => (theme::IDLE, "未绑定"),
-            (true, true, _) => (theme::OK, "密钥就绪"),
+            // 密钥在就是「已绑定」——判定依据是本机密钥（核对过），不是云端那条记录。
+            (true, true, _) => (theme::OK, "已绑定"),
+            (false, _, _) if local_only.is_some() => (theme::OK, "已绑定"),
             (true, false, true) => (theme::WARN, "密钥不完整"),
             (true, false, false) => (theme::WARN, "缺密钥"),
+            (false, _, _) => (theme::IDLE, "未绑定"),
         };
         theme::card(ui, width, |ui| {
             theme::card_head_rev(ui, "密钥获取", color, status);
@@ -1313,15 +1373,28 @@ impl Console {
                     } else {
                         ui.label(theme::faint(&format!("尚未采集 {wxid} 的密钥")));
                     }
-                    if others > 0 {
-                        ui.label(theme::faint(&format!(
-                            "本机另有 {others} 个其他账号的密钥，当前账号不可用"
-                        )));
-                    }
+                    // 这里原本还有一行"本机另有 N 个其他账号的密钥，当前账号不可用"——
+                    // 卡片上明明写着「密钥就绪」，它却读起来像"当前账号不能用"，客户直接
+                    // 被绕晕。别的声音去掉：只显示当前绑定的那个号的状态。
                 }
                 None => {
-                    ui.label(theme::value("尚未绑定微信号"));
-                    ui.label(theme::faint("在云端网页「绑定微信」后回到这里"));
+                    match local_only.as_deref() {
+                        // 本机有可用密钥、云端没登记：这是**两件事**，得分开说清楚。
+                        Some(wxid) => {
+                            let display = self
+                                .snap
+                                .wechat_name
+                                .clone()
+                                .unwrap_or_else(|| wxid.to_owned());
+                            ui.add(egui::Label::new(theme::value(&display)).truncate());
+                            ui.label(theme::faint(&format!("本机已抓到 {wxid} 的密钥，解密缓存也在")));
+                            ui.label(theme::faint("云端还没把这个微信号登记到本机：在网页点「绑定微信账号」即可"));
+                        }
+                        None => {
+                            ui.label(theme::value("尚未绑定微信号"));
+                            ui.label(theme::faint("在云端网页「绑定微信」后回到这里"));
+                        }
+                    }
                 }
             }
             ui.add_space(10.0);

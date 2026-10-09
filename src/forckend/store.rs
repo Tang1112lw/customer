@@ -74,6 +74,14 @@ pub fn default_token_file() -> PathBuf {
     install_dir().join("api.token")
 }
 
+/// 刷新令牌的位置：与 `api.token` 同目录，文件名固定 `api.refresh`。
+///
+/// access token 只有 2 小时，服务靠这个刷新令牌自动续期（见
+/// `backend::service::agent_service` 的续期任务）。登录时由登录窗口写入。
+pub fn default_refresh_file() -> PathBuf {
+    install_dir().join("api.refresh")
+}
+
 /// 默认设备标识文件位置。
 pub fn default_device_file() -> PathBuf {
     install_dir().join("device.id")

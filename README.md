@@ -10,8 +10,8 @@
 | --- | --- | --- | --- |
 | `aicrm_windows_api` | `src/main.rs` | 后台服务：HTTP 接口 + 云端命令通道 | 无界面，由 `HKCU\...\Run` 隐藏启动 |
 | `aicrm-login` | `src/forckend/main.rs` | 登录窗口（egui） | `--endpoint` / `--token-file` / `--device-file`，见下 |
-| `aicrm-console` | `src/forckend/console.rs` | 主窗口：侧边栏 + 状态总览（云端 / 密钥 / 服务）+ 配置页 + 账号菜单；**托管本地服务**；**首次未配对时显示「连接云端」引导页** | 无参数；`--hidden` 只进托盘不弹窗；`--start-service` 只起服务不显示窗口 |
-| `aicrm-tray` | `src/forckend/tray.rs` | 系统托盘：看服务状态、打开主界面、启停服务、退出 | `--bind` / `--data-dir`；退出时会一并 `taskkill` 掉后台服务 |
+| `aicrm-console` | `src/forckend/console.rs` | 主窗口：侧边栏 + 状态总览（云端 / 密钥 / 服务）+ 配置页 + 账号菜单；**托管本地服务**；**首次未配对时显示「连接云端」引导页**；托盘形态由 `--hidden` 提供（原独立托盘程序已并入） | 无参数；`--hidden` 只进托盘不弹窗；`--start-service` 只起服务不显示窗口 |
+| `aicrm-update` | `src/update/main.rs` | **原生更新器**（取代 PowerShell 脚本）：校验摘要与目标名白名单 → 先停客户端进程 → 备份 → 覆盖 → 按 `startup.json` 重启 → 探活失败回滚；也承担快捷方式创建（`--ensure-shortcut`） | 由服务在应用更新时拉起；`--ensure-shortcut` 供安装脚本调用 |
 | `aicrm-setup` | `src/forckend/setup.rs` | **静默安装**：不问任何东西，打开即装盘 → 装完自动拉起客户端 → 自己退出 | `--endpoint`；`--extract-only` 自检内嵌载荷。单文件形态由 `aicrm-pack` 拼出 |
 | `aicrm-pack` | `src/pack/main.rs` | 打包工具：安装器 + 全部载荷 → 单文件安装程序 | `cargo run --release --bin aicrm-pack [输出路径]` |
 
@@ -23,11 +23,11 @@
 - **一个时间只有一个界面**：`src/forckend/single.rs` 用命名互斥体 `Local\AICRM.WinClient` 做单实例，主界面与安装器**共用同一把锁**，所以两者不会并排出现。重复启动时把已有窗口 `SW_RESTORE` + 置前，而不是再开一个。开窗前先 `acquire()`；安装器装完要拉起主界面前必须 `release()`，否则主界面会被自己那把锁挡掉（表现为"装完了但客户端弹不出来"）。
 - **打开客户端 = 服务就该在跑**：主窗口启动时托管 `aicrm_windows_api.exe`，每 5 秒的刷新里检查一次，没起就拉起、掉了就重启。用户手点「停止服务」时置 `auto_service=false` 不再自动拉起，点「启动服务」恢复。服务是采集和心跳的载体，它一掉云端立刻把设备标离线，网页端也就点不动「绑定微信」。
 
-托盘图标颜色就是服务状态（绿=运行中、灰=已停止），菜单里「令牌」一项看 `api.token` 是否非空；「服务在不在」是直接连 `--bind` 端口判定的，比查进程名更能说明"到底能不能用"。
+托盘（`aicrm-console --hidden` 的形态）图标颜色就是服务状态（绿=运行中、灰=已停止），菜单里「令牌」一项看 `api.token` 是否非空；「服务在不在」是直接连 `--bind` 端口判定的，比查进程名更能说明"到底能不能用"。
 
 ## 安装与运行
 
-在本项目目录运行 `./install.ps1`。脚本编译 Rust 服务，把三个客户端程序（`aicrm_windows_api.exe`、`aicrm-login.exe`、`aicrm-tray.exe`）、`AICRM-Key.exe` 与 Markdown 导出程序放到 `%LOCALAPPDATA%\AICRM-Windows-API\`，生成权限限定为当前用户、SYSTEM 和管理员的 `api.token`，注册登录自启并立即启动。现有密钥仍读取本项目 `src\tools\accounts\`，不会复制或删除。服务默认监听 `127.0.0.1:8765`。需要更换密钥目录或监听地址时使用 `./install.ps1 -KeyDir 'D:\密钥目录' -Bind '127.0.0.1:8765'`。重新运行安装脚本会更新程序并重启服务，不会更换已有 token。
+在本项目目录运行 `./install.ps1`。脚本编译 Rust 程序，把客户端四件套（`aicrm_windows_api.exe` / `aicrm-console.exe` / `aicrm-login.exe` / `aicrm-update.exe`）、`AICRM-Key.exe` 与 Markdown 导出程序放到 `%LOCALAPPDATA%\AICRM-Windows-API\`，生成权限限定为当前用户、SYSTEM 和管理员的 `api.token`，注册登录自启并立即启动。现有密钥仍读取本项目 `src\tools\accounts\`，不会复制或删除。服务默认监听 `127.0.0.1:8765`。需要更换密钥目录或监听地址时使用 `./install.ps1 -KeyDir 'D:\密钥目录' -Bind '127.0.0.1:8765'`。重新运行安装脚本会更新程序并重启服务，不会更换已有 token。
 
 ### 设备归属：会话制（2026-10-09 起）
 
@@ -50,12 +50,13 @@ PUT /api/agent/v1/status
 | 场景 | 结果 |
 |---|---|
 | 客户端登录 A，网页也登录 A | 网页看得到，可绑定可采集 |
-| 客户端换成 B | 下一个心跳登记 B，网页用 B 登录即生效，**不需要重启客户端、不需要重新配对** |
+| 客户端换成 B | 下一个心跳登记 B，网页用 B 登录即生效，**不需要重启客户端、不需要重新配对**；**A 随即不再看到这台设备**（2026-10-10 起可见性 = 最近一次会话账号，历史会话只用于追溯） |
 | 网页登录这台机器上从没登录过的 C | 0 台设备，按钮置灰 |
 
 设计要点：
 
 - **不挪任何归属字段。** 早前的"认领制"（把设备记录改挂到某账号）会和按账号隔离的数据打架 —— 设备被挪走，`wechat_accounts`、历史任务还留在旧账号名下，绑定就出错。会话制只在旁边加一行记录，谁的数据都不动。
+- **可见性只看「最近一次会话」。** 2026-10-10 收紧：不能"登录过就永久可见"（旧账号会在机器已换人使用时继续看到它，实测被指出过）；绑定与网页「推送更新」使用同一判定，避免"看得见绑不了"。从未产生过会话的设备回退给配对账号；管理员（all）照旧全量。
 - **失败不影响心跳。** 令牌过期、账号被禁用只是"这次没登记"，服务照常用。心跳挂了会让整台设备判离线，代价比归属错高得多。
 - **切换延迟 20 秒，不需要重启。** 客户端不需要为换账号做任何事，更不需要修改服务端或用认领接口去挪归属记录。
 
@@ -138,7 +139,7 @@ Content-Type: application/json
 {"code":401,"message":"账号或密码错误","data":null}
 ```
 
-客户端要求 `code == 0` **且**响应里带 `data.accessToken`；缺 `data` 或信封形状不对会报「云端返回的不是 {code,message,data} 信封 / 云端返回成功但缺少 data」，那属于前后端版本不匹配，不是凭据问题。`refreshToken` 目前只被解析和打码保留，尚未用于自动续期。客户端把 `4xx` 当作"凭据错误、重试无用"，把 `5xx` 与网络故障当作"可重试"。云端签发令牌后应把它与该 `device_id` 一起入库，**之后云端调用本地 API 时用的就是这同一个令牌** —— 所以令牌不需要任何人工"交付"。`device_id` 让云端能够单独撤销某一台设备而不影响其他设备。
+客户端要求 `code == 0` **且**响应里带 `data.accessToken`；缺 `data` 或信封形状不对会报「云端返回的不是 {code,message,data} 信封 / 云端返回成功但缺少 data」，那属于前后端版本不匹配，不是凭据问题。`refreshToken` 会落盘到 `api.refresh`，由后台服务每 30 分钟自动续期（见「云端命令通道 · 令牌自动续期」）。客户端把 `4xx` 当作"凭据错误、重试无用"，把 `5xx` 与网络故障当作"可重试"。云端签发令牌后应把它与该 `device_id` 一起入库，**之后云端调用本地 API 时用的就是这同一个令牌** —— 所以令牌不需要任何人工"交付"。`device_id` 让云端能够单独撤销某一台设备而不影响其他设备。
 
 ### 本地联调
 
@@ -180,11 +181,11 @@ Start-Process pwsh -ArgumentList '-NoProfile','-File','.\mock-agent-cloud.ps1','
 | POST | `/api/aicrm/export/stream` | 运行导出，返回本次每个 `messages.json` 文档的 NDJSON；不含附件字节 |
 | POST | `/api/aicrm/export/bundle` | 下载原始 JSON 和附件 ZIP |
 | POST | `/api/aicrm/export/ai-bundle` | 下载原始 JSON、附件及精简 `chat.txt` ZIP |
-| POST | `/api/aicrm/collect` | 数据采集：后台导出两个程序、合并归档包并上传云端；**立即返回 202，不等导出跑完** |
+| POST | `/api/aicrm/collect` | 数据采集：后台导出、合并归档包并上传云端；**立即返回 202，不等导出跑完**（当前由云端下发的 `wechat.collect` 触发；本机接口保留兼容） |
 
 导出请求示例：`{"wxid":"wxid_xxx","day":14}`。`wxid` 可省略，由辅助程序识别当前账号；`person` 可限定联系人或群名；`day` 为含今天的最近 N 天；`start` 与 `end` 必须同时提供，且不能和 `day` 同用。`task_id`、`wechat_dir` 可选；`export_dir` 是云端指定的落盘目录，给了就直接导到那里（不清理、不删），不给才用 `data\jobs\<id>` 临时目录。请求体带 `deny_unknown_fields`，字段名写错会立刻 422 而不是被静默忽略。未指定联系人和日期即导出全部历史。每个请求使用独立导出目录，所以多个导出可并发；密钥准备操作与导出互斥（同一个 `RwLock` 闸门）。
 
-`/api/aicrm/collect` 的请求体是另一套字段，全部必填：`task_id`、`execution_token`、`user_token`、`upload_url`（形如 `https://云端/api/tasks/<taskId>/upload`），加上与导出同名的可选筛选 `wxid` / `person` / `day` / `start` / `end`。它**不能在请求里等到底**：导出要跑几分钟，挂在请求里的话浏览器一切页面、刷新或关标签就会断开连接、handler 被丢弃，采集被一起取消（归档目录写到一半不动、云端任务永远停在 `created`，实测踩过）。所以它只把活儿丢进后台就回 202，前端照旧轮询 `GET /api/tasks/{id}` 看进度。上传用 multipart，字段名必须是 `file`，并同时带 `X-Execution-Token` 与 `Authorization: Bearer <user_token>` —— 只带执行令牌会被云端 401。
+`/api/aicrm/collect` 的请求体是另一套字段，全部必填：`task_id`、`execution_token`、`user_token`、`upload_url`（形如 `https://云端/api/tasks/<taskId>/upload`），加上与导出同名的可选筛选 `wxid` / `person` / `day` / `start` / `end`。它**不能在请求里等到底**：导出要跑几分钟，挂在请求里的话调用方一断开连接、handler 就被丢弃，采集被一起取消（归档目录写到一半不动、云端任务永远停在 `created`，实测踩过）。所以它只把活儿丢进后台就回 202，进度由客户端上报，网页轮询 `GET /api/tasks/{id}` 查看。上传用 multipart，字段名必须是 `file`，并同时带 `X-Execution-Token` 与 `Authorization: Bearer <user_token>` —— 只带执行令牌会被云端 401。
 
 `/stream` 的格式是 Windows 专用 `aicrm-windows-files/v1`：首行 `meta`，每个文件一行 `{"type":"file","path":".../messages.json","document":{...}}`，末行 `summary`。它不伪装成 Android 的 `aicrm-compact/v1`。需要语音、图片等附件时调用 ZIP 接口。
 
@@ -221,9 +222,10 @@ CORS 中间件包在最外层（比鉴权还外）：预检 `OPTIONS` 不带 `Au
 
 - 心跳：每 20 秒 `PUT <cloud>/api/agent/v1/status`。云端靠它判断设备在线，没有心跳网页端就不允许对这台设备下发采集任务。`wechat.online` 要求微信进程在跑、wxid 已绑定、本地库在、密钥就绪，任一不成立就如实报 `false`。
   **心跳还顺带把登录账号带给云端**（`X-AICRM-User-Token`，每次现读 `api.token`）—— 这决定了网页端登录哪个账号才看得见这台客户端，详见下方「设备归属：会话制」。
+- **令牌自动续期**（2026-10-10 起）：登录时 refresh token 落盘 `api.refresh`；服务每 30 分钟换新 access token 并写回。此前只存 access token（2 小时过期），过期后心跳里的会话登记与绑定拉取全部失效（表现为网页端设备"登录账号"停更、控制台误报未绑定）。
 - 取命令：`POST <cloud>/api/agent/v1/commands/poll` 长轮询，挂起 `waitSeconds=25` 秒。
 - 回传：`PUT <cloud>/api/agent/v1/commands/<id>/result`。
-- 命令类型三种：`wechat.bind`（取密钥，可能重启微信，云端只应在确认客户在场时下发）、`wechat.export`（导出，结果留在本机）、`wechat.collect`（导出 + 归档上传，结果交回云端）。不支持的类型回 `UNSUPPORTED_COMMAND`，不会中断轮询。
+- 命令类型四种：`wechat.bind`（取密钥，可能重启微信，云端只应在确认客户在场时下发）、`wechat.export`（导出，结果留在本机）、`wechat.collect`（导出 + 归档上传，结果交回云端）、`agent.update`（自更新，见下方章节）。**采集当前由云端下发**：网页点「数据采集」→ 云端向绑定设备入队 `wechat.collect`，不再由浏览器直连本机；本机 `/api/aicrm/collect` 接口保留兼容。不支持的类型回 `UNSUPPORTED_COMMAND`，不会中断轮询。
 - 这三个请求都用 `Authorization: Device <token>` + `X-AICRM-Device-ID` 两个头，与本地 API 的 `Bearer` 不是同一套。
 
 ## 本机调用
@@ -246,6 +248,16 @@ Invoke-WebRequest "$base/api/aicrm/export/ai-bundle" -Method Post -Headers $head
 随后单独复测最终版 NDJSON，源数据增加至 2,541 条消息，末行 summary 成功且不含已删除的临时路径。密钥接口用 `no_restart=true` 验证成功，返回值不含密钥正文；单联系人原始 ZIP 包含 5 个 JSON 和 2 个音频文件；`/export` 的本地文件模式返回 185 条消息、5 个 JSON，结果保留在其 `job_dir`。两个帮助接口均返回 200。
 
 ## 更新记录
+
+### 2026-10-10（自更新全自动 · 整包 · 令牌续期 · 采集可靠性）
+
+- **自更新不再等人工**：下载校验就绪后，服务等「重活计数（采集 / 导出 / 绑定）归零 + 15 秒回执余量」自动拉起更新器重启应用；「下次启动」仅作兜底。0.1.33 起生效，更早版本仍需人工重启一次。
+- **整包更新**：一个版本发布 服务 / 界面 / 登录 三件套，逐件替换（白名单兜底）；旧客户端仍只收单件。界面版本号改读服务写入的 `data/state/version.json` —— 只有「真实在跑的版本」一个来源。
+- **`pending.json` 只升不降**：拒绝更低版本写入，防止旧命令覆盖新标记。
+- **下载超时 45s→600s**：整包里的界面程序近 10 MB，原超时必误杀。
+- **登录令牌自动续期**：登录落 `api.refresh`，服务每 30 分钟续期写回；修复「2 小时过期后设备归属停更 / 控制台误报未绑定」。
+- **采集可靠性**：前置检查失败（微信未运行 / 密钥不齐）也回传云端，不再留僵尸任务堵住后续采集；导出 / 打包失败同样回报。
+- **密钥链路修正**：解密缓存改认 `accounts/cache/*.db`（此前查错路径导致设备永远判未就绪、采集下发不了）；换号后取「最近抓到」的账号目录；`prepare` 复用收紧（仅核对模式或定向匹配才复用，其余真抓）。
 
 ### 2026-10-09（本轮）
 
@@ -310,11 +322,12 @@ Invoke-WebRequest "$base/api/aicrm/export/ai-bundle" -Method Post -Headers $head
 客户端每 20 秒心跳一次上报 `agentVersion`；云端发现落后于已发布版本时下发 `agent.update`。
 更新包与指令都**不经过网页** —— 网页只是仪表盘（显示版本落后、提供手动推送按钮）。
 
-- 下载：凭 Device 令牌取 `GET <云端>/api/agent/v1/programs/agent`，本地 SHA-256 校验
-- 落盘：`updates/<版本>/` + `updates/pending.json`
+- 下载：凭 Device 令牌取 `GET <云端>/api/agent/v1/programs/agent`（整包时逐件再取 `console`、`login`，共三件套；0.1.43 前的旧客户端只认单件），本地 SHA-256 校验。下载超时 600 秒 —— 整包里的界面程序近 10 MB，曾用 45 秒长轮询超时，下载必被误杀
+- 落盘：`updates/<版本>/` + `updates/pending.json`（**只允许升级写入**：云端换版本快于下载时，后到的旧命令不得覆盖新标记）
+- 应用时机（0.1.33 起）：下载校验就绪后**等空闲自动重启应用** —— 重活计数（采集 / 导出 / 绑定）归零、再留 15 秒把命令回执发出去，然后拉起更新器；一直忙则退回「下次启动」兜底路径
 - 替换：拉起 **`aicrm-update.exe`**（原生 exe，不经解释器）完成：
-  宽限期 → 复算摘要 → 校验目标名白名单 → 备份 → 停进程 → 覆盖 →
-  按 `data/state/startup.json` 记录的启动命令重启 →
+  宽限期 → 复算摘要 → 校验目标名白名单 → 备份 → 先停客户端进程（含会保活服务的
+  主界面）→ 覆盖（遇占用自动重试）→ 按 `data/state/startup.json` 记录的启动命令重启 →
   刷新桌面/开始菜单快捷方式与图标缓存 → 确认服务存活；失败回滚
 
 三个必须记住的约束：
