@@ -166,6 +166,10 @@ impl Service {
             Err(error) => {
                 self.state
                     .mark_upload(&request.task_id, false, &error.message(), "", "");
+                // 失败了必须告诉云端。采集是在后台任务里跑的，浏览器早就不再等那个
+                // 请求 —— 不上报，任务就一直停在 created，网页永远显示"采集中"，
+                // 只能干等僵尸任务清理（15 分钟）把它放开。
+                report_task_failure(&request, &error.message());
             }
         }
 
@@ -208,54 +212,12 @@ impl Service {
 /// 目录结构由导出程序决定：`<导出目录>/<wxid>/<会话>/<YYYY-MM-DD>/messages.md`。
 /// 会话文件夹名就是会话标识（群聊为 `xxx@chatroom`，单聊为联系人名），云端按它分会话。
 fn build_archive(root: &Path, task_id: &str) -> Result<Value, String> {
-    // 先定位 wxid 层：优先用任务里的 wxid，否则取导出目录下唯一的子目录。
-    let account_root = locate_account_root(root)?;
     let mut conversations: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-    for entry in
-        fs::read_dir(&account_root).map_err(|error| format!("读取 {} 失败：{error}", account_root.display()))?
-    {
-        let entry = entry.map_err(|error| format!("读取会话目录失败：{error}"))?;
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let Some(conversation) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        for day_entry in
-            fs::read_dir(&path).map_err(|error| format!("读取 {} 失败：{error}", path.display()))?
-        {
-            let day_entry = day_entry.map_err(|error| format!("读取日期目录失败：{error}"))?;
-            let day_path = day_entry.path();
-            if !day_path.is_dir() {
-                continue;
-            }
-            let Some(date) = day_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .filter(|name| is_iso_date(name))
-            else {
-                continue;
-            };
-            let markdown_path = day_path.join("messages.md");
-            if !markdown_path.is_file() {
-                continue;
-            }
-            let markdown = fs::read_to_string(&markdown_path)
-                .map_err(|error| format!("读取 {} 失败：{error}", markdown_path.display()))?;
-            if markdown.trim().is_empty() {
-                continue;
-            }
-            conversations
-                .entry(conversation.to_string())
-                .or_default()
-                .insert(date.to_string(), markdown);
-        }
-    }
+    collect_days(root, &mut conversations)?;
     if conversations.is_empty() {
         return Err(format!(
-            "导出目录里没有找到任何 messages.md：{}",
-            account_root.display()
+            "导出目录里没有找到任何 messages.md：{}（导出程序可能没产出数据）",
+            root.display()
         ));
     }
 
@@ -297,19 +259,54 @@ fn build_archive(root: &Path, task_id: &str) -> Result<Value, String> {
     }))
 }
 
-/// 定位导出目录下的账号层目录。
-fn locate_account_root(root: &Path) -> Result<std::path::PathBuf, String> {
-    let direct = root.join("messages.md");
-    if !direct.is_file() {
-        let entries = fs::read_dir(root)
-            .map_err(|error| format!("读取 {} 失败：{error}", root.display()))?;
-        for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                return Ok(entry.path());
-            }
+/// 递归收集目录树里的 `<会话>/<日期>/messages.md`，按会话分组放回 `out`。
+///
+/// 不能假设"导出目录下第一个子目录就是账号层"：导出程序会在同一层并排放
+/// `.locks` 这类内部目录，靠名字猜或靠遍历顺序取第一个，命中与否全看运气。
+/// 实测就因为先枚举到 `.locks`，一个会话都没找到 —— 导出的 Markdown 明明躺在
+/// 旁边的 `<wxid>/<会话>/<日期>/messages.md` 里。所以改成按**结构特征**识别：
+/// 目录名是日期且里面有 `messages.md`，就是一个有效日期；其余向下继续钻。
+/// 以点开头的目录一律跳过（它们是程序的内部产物，不是聊天数据）。
+fn collect_days(
+    dir: &Path,
+    out: &mut BTreeMap<String, BTreeMap<String, String>>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(dir).map_err(|error| format!("读取 {} 失败：{error}", dir.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
         }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        if is_iso_date(name) {
+            let markdown_path = path.join("messages.md");
+            if !markdown_path.is_file() {
+                continue;
+            }
+            let markdown = fs::read_to_string(&markdown_path)
+                .map_err(|error| format!("读取 {} 失败：{error}", markdown_path.display()))?;
+            if markdown.trim().is_empty() {
+                continue;
+            }
+            // 会话标识取日期目录的上一层；群聊能据 @chatroom 判定类型。
+            let conversation = dir
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("未知会话")
+                .to_string();
+            out.entry(conversation)
+                .or_default()
+                .insert(name.to_string(), markdown);
+            continue;
+        }
+        collect_days(&path, out)?;
     }
-    Ok(root.to_path_buf())
+    Ok(())
 }
 
 fn is_iso_date(value: &str) -> bool {
@@ -329,6 +326,40 @@ fn count_markdown_messages(markdown: &str) -> usize {
         .lines()
         .filter(|line| line.trim_start().starts_with("- "))
         .count()
+}
+
+/// 通知云端「这次采集失败了」。
+///
+/// 状态接口与上传接口同源：`.../api/tasks/<id>/upload` → `.../api/tasks/<id>/status`。
+/// 上报失败只打日志 —— 此时已经无可挽回，不能让它掩盖真正的采集失败原因。
+fn report_task_failure(request: &ArchiveRequest, message: &str) {
+    let Some(status_url) = request.upload_url.strip_suffix("/upload") else {
+        return;
+    };
+    let status_url = format!("{status_url}/status");
+    let message = if message.is_empty() {
+        "客户端采集失败（原因未知）".to_string()
+    } else {
+        message.chars().take(1000).collect()
+    };
+    let report = || -> Result<(), String> {
+        let payload = json!({ "status": "failed", "message": message }).to_string();
+        let response = ureq::post(&status_url)
+            .header("X-Execution-Token", &request.execution_token)
+            .header("Authorization", &format!("Bearer {}", request.user_token))
+            .header("Content-Type", "application/json")
+            .send(payload.as_bytes())
+            .map_err(|error| format!("上报失败：{error}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("HTTP {status}"));
+        }
+        Ok(())
+    };
+    match report() {
+        Ok(()) => eprintln!("采集失败已上报云端：{message}"),
+        Err(error) => eprintln!("云端未能记下这次失败（{error}），原始原因：{message}"),
+    }
 }
 
 /// 以 multipart/form-data 上传归档包。字段名必须是 `file`。
@@ -392,13 +423,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let chat = dir.path().join("wxid_demo").join("张三").join("2026-10-05");
         fs::create_dir_all(&chat).unwrap();
-        fs::write(
-            chat.join("messages.json"),
-            r#"{"schema_version":"aicrm-chat/v1","chat":{"display_name":"张三","id":"wxid_zhangsan","type":"contact"},"date_range":{"start":"2026-10-05","end":"2026-10-05"},"messages":[{"sequence":1}]}"#,
-        )
-        .unwrap();
-        // Markdown 与媒体文件都不该被收进归档
-        fs::write(chat.join("messages.md"), "# 2026-10-05\n").unwrap();
+        fs::write(chat.join("messages.md"), "- **张三** 10:01:00：你好\n").unwrap();
+        // JSON 与媒体文件都不该被收进归档
+        fs::write(chat.join("messages.json"), r#"{"messages":[]}"#).unwrap();
         fs::write(chat.join("voice.silk"), b"x").unwrap();
 
         let bundle = build_archive(dir.path(), "task-1").unwrap();
@@ -406,17 +433,30 @@ mod tests {
         assert_eq!(bundle["task_id"], "task-1");
         assert_eq!(bundle["bootstrap"], false);
         let exports = bundle["exports"].as_array().unwrap();
-        assert_eq!(exports.len(), 1, "只应收集 messages.json");
-        assert_eq!(exports[0]["chat"]["id"], "wxid_zhangsan");
-        assert_eq!(exports[0]["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(exports.len(), 1, "只应收集 messages.md");
+        // Markdown 里没有会话 ID，用文件夹名当标识；@chatroom 判群聊。
+        assert_eq!(exports[0]["chat"]["id"], "张三");
+        assert_eq!(exports[0]["chat"]["type"], "contact");
+        assert_eq!(exports[0]["days"][0]["date"], "2026-10-05");
+        assert_eq!(exports[0]["days"][0]["message_count"], 1);
     }
 
+    /// 回归：导出程序会在导出根下并排放 `.locks` 这类内部目录。
+    ///
+    /// 以前的实现取"第一个子目录"当账号层 —— 命中 `.locks` 就会一个会话都找不到，
+    /// 表现是客户端报「导出目录里没有找到任何 messages.md」，而数据其实好端端躺在旁边。
     #[test]
-    fn missing_chat_field_is_rejected() {
+    fn hidden_lock_directory_does_not_hide_conversations() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("messages.json"), r#"{"messages":[]}"#).unwrap();
-        let error = build_archive(dir.path(), "task-1").unwrap_err();
-        assert!(error.contains("缺少 chat"), "实际：{error}");
+        fs::create_dir_all(dir.path().join(".locks")).unwrap();
+        let chat = dir.path().join("wxid_demo").join("李四").join("2026-10-06");
+        fs::create_dir_all(&chat).unwrap();
+        fs::write(chat.join("messages.md"), "- **李四** 10:01:00：嗨\n").unwrap();
+
+        let bundle = build_archive(dir.path(), "task-2").unwrap();
+        let exports = bundle["exports"].as_array().unwrap();
+        assert_eq!(exports.len(), 1, "内部目录不能被当成会话层");
+        assert_eq!(exports[0]["chat"]["id"], "李四");
     }
 
     #[test]
