@@ -1,6 +1,6 @@
 [package]
 name = "aicrm_windows_api"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 
 # 后台服务：无界面，由 HKCU Run 隐藏启动

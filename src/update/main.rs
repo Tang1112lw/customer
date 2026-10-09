@@ -327,15 +327,52 @@ fn service_alive() -> bool {
     }
 }
 
-/// 刷新指向本安装目录的快捷方式。
+/// 规范快捷方式的文件名（桌面与开始菜单共用）。
+const SHORTCUT_NAME: &str = "AICRM 客户端.lnk";
+/// 安装时存档的快捷方式模板：更新器用它重建，避免在 Rust 里重写一遍 .lnk 的二进制格式。
+const SHORTCUT_TEMPLATE: &str = "shortcut-AICRM客户端.lnk";
+
+/// 刷新快捷方式：**先清掉旧的和不规范的，再按存档模板重建**。
 ///
-/// exe 被替换后快捷方式的**目标路径没变**，但 Windows 与资源管理器都缓存了旧图标，
-/// 表现为"更新完了桌面图标还是老样子"。把 .lnk 原样重写一遍（只更新时间戳）就能
-/// 让系统重新读取它；再叫一次图标缓存刷新程序。
-///
-/// .lnk 是二进制格式，但里面以明文（UTF-16LE 或 ANSI）存着目标路径 ——
-/// 直接按内容判断归属，比解析格式或引入 COM 依赖简单可靠得多。
+/// 为什么不能只刷新时间戳：客户桌面上可能有上一版安装包留下的、指向旧路径或旧
+/// 安装包的快捷方式。只刷新自己的那一个，旧的会一直留着，客户点了打不开东西。
 fn refresh_shortcuts(options: &Options) {
+    let template = options
+        .install_dir
+        .join("data")
+        .join("state")
+        .join(SHORTCUT_TEMPLATE);
+    let template_ready = template.is_file();
+
+    let mut removed = 0usize;
+    for root in shortcut_roots() {
+        removed += cleanup_shortcuts(&root, options.install_dir.as_path(), template_ready, 0);
+    }
+
+    // 桌面 + 用户开始菜单 + 公共开始菜单，各放一份
+    let mut rebuilt = 0usize;
+    if template_ready {
+        for target in shortcut_locations() {
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if std::fs::copy(&template, &target).is_ok() {
+                rebuilt += 1;
+            }
+        }
+    }
+
+    if rebuilt > 0 || removed > 0 {
+        // 图标缓存不清，资源管理器可能继续用旧图标。
+        let _ = Command::new("ie4uinit.exe").arg("-show").output();
+    }
+    log(
+        &options.log_file(),
+        &format!("快捷方式：清理 {removed} 个、重建 {rebuilt} 个"),
+    );
+}
+
+fn shortcut_roots() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Some(profile) = std::env::var_os("USERPROFILE") {
         let profile = PathBuf::from(profile);
@@ -343,33 +380,33 @@ fn refresh_shortcuts(options: &Options) {
         roots.push(profile.join("AppData/Roaming/Microsoft/Windows/Start Menu/Programs"));
     }
     roots.push(PathBuf::from("C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs"));
-
-    let mut refreshed = 0usize;
-    for root in roots {
-        refreshed += refresh_in(&root, &options.install_dir, 0);
-    }
-    if refreshed > 0 {
-        // 图标缓存不清，资源管理器可能继续用旧图标。
-        let _ = Command::new("ie4uinit.exe").arg("-show").output();
-    }
-    log(
-        &options.log_file(),
-        &format!("已刷新 {refreshed} 个指向本安装目录的快捷方式"),
-    );
+    roots
 }
 
-fn refresh_in(directory: &Path, install_dir: &Path, depth: usize) -> usize {
+fn shortcut_locations() -> Vec<PathBuf> {
+    shortcut_roots()
+        .into_iter()
+        .map(|root| root.join(SHORTCUT_NAME))
+        .collect()
+}
+
+/// 删掉陈旧的 AICRM 快捷方式。
+///
+/// 判定「陈旧」的两条依据：文件名里带 aicrm（旧版本可能用别的名字），
+/// 或 .lnk 内容里出现 AICRM 的安装目录 / 安装包名。规范名称的那个也一起删 ——
+/// 反正随后会用模板重建，删掉重建比原地改更干净。
+fn cleanup_shortcuts(directory: &Path, install_dir: &Path, template_ready: bool, depth: usize) -> usize {
     if depth > 3 {
         return 0;
     }
     let Ok(entries) = std::fs::read_dir(directory) else {
         return 0;
     };
-    let mut count = 0;
+    let mut removed = 0usize;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            count += refresh_in(&path, install_dir, depth + 1);
+            removed += cleanup_shortcuts(&path, install_dir, template_ready, depth + 1);
             continue;
         }
         let is_shortcut = path
@@ -377,37 +414,53 @@ fn refresh_in(directory: &Path, install_dir: &Path, depth: usize) -> usize {
             .and_then(|value| value.to_str())
             .map(|value| value.eq_ignore_ascii_case("lnk"))
             .unwrap_or(false);
-        if is_shortcut && shortcut_points_to(&path, install_dir) {
-            // 读出来再原样写回：内容不变，时间戳刷新。
-            if let Ok(bytes) = std::fs::read(&path) {
-                if std::fs::write(&path, bytes).is_ok() {
-                    count += 1;
-                }
-            }
+        if !is_shortcut {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        let canonical = name == SHORTCUT_NAME.to_lowercase();
+        let related = name.contains("aicrm")
+            || matches_shortcut_content(&path, install_dir)
+            || content_contains(&path, "aicrm-setup");
+        if !related {
+            continue;
+        }
+        // 没有模板时不能删规范快捷方式 —— 删了就再没人重建，客户桌面上会少一个入口。
+        if canonical && !template_ready {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            removed += 1;
         }
     }
-    count
+    removed
 }
 
-fn shortcut_points_to(path: &Path, install_dir: &Path) -> bool {
+fn matches_shortcut_content(path: &Path, install_dir: &Path) -> bool {
+    content_contains(path, &install_dir.to_string_lossy().to_lowercase())
+}
+
+/// .lnk 是二进制格式，但目标路径以明文（UTF-16LE 或 ANSI）存在里面，
+/// 按内容判断比解析格式或引入 COM 依赖简单可靠。
+fn content_contains(path: &Path, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
     let Ok(bytes) = std::fs::read(path) else {
         return false;
     };
-    let text = install_dir.to_string_lossy().to_lowercase();
-    let utf16: Vec<u8> = text
+    let utf16: Vec<u8> = needle
         .encode_utf16()
         .flat_map(|unit| unit.to_le_bytes())
         .collect();
-    if !utf16.is_empty()
-        && bytes
-            .windows(utf16.len())
-            .any(|window| window == utf16.as_slice())
-    {
+    if !utf16.is_empty() && bytes.windows(utf16.len()).any(|window| window == utf16.as_slice()) {
         return true;
     }
-    String::from_utf8_lossy(&bytes)
-        .to_lowercase()
-        .contains(&text)
+    String::from_utf8_lossy(&bytes).to_lowercase().contains(needle)
 }
 
 fn rollback(install_dir: &Path, backup: &Path, replaced: &[String]) {
