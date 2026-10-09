@@ -175,6 +175,8 @@ fn apply(options: &Options) -> Result<(), String> {
     log(&options.log_file(), "替换完成，重启客户端");
     start_clients(options)?;
     refresh_shortcuts(options);
+    // 过期安装包也一并收走：客户桌面上不该堆着点不开的旧版本。
+    archive_stale_packages(options);
     confirm_restart(options, &replaced, &backup)?;
     let _ = std::fs::remove_file(&pending_file);
     let message = format!("已更新到 {version}；旧版本备份在 {}", backup.display());
@@ -362,10 +364,8 @@ fn refresh_shortcuts(options: &Options) {
         }
     }
 
-    if rebuilt > 0 || removed > 0 {
-        // 图标缓存不清，资源管理器可能继续用旧图标。
-        let _ = Command::new("ie4uinit.exe").arg("-show").output();
-    }
+    // 无条件刷新：桌面上可能有被删/被挪走的文件留下的残留图标，客户不会去按 F5。
+    let _ = Command::new("ie4uinit.exe").arg("-show").output();
     log(
         &options.log_file(),
         &format!("快捷方式：清理 {removed} 个、重建 {rebuilt} 个"),
@@ -388,6 +388,59 @@ fn shortcut_locations() -> Vec<PathBuf> {
         .into_iter()
         .map(|root| root.join(SHORTCUT_NAME))
         .collect()
+}
+
+/// 归档过期安装包：把桌面/下载里版本与当前不一致的 `AICRM-Setup-*.exe`
+/// 挪进安装目录的 `updates/archive/`。
+///
+/// 每次发布都会在客户桌面留一个新的安装包，旧版本越堆越多，而且一旦被挪走或清掉，
+/// 桌面上会留下点开就报「找不到文件」的残留图标。客户不该管这些 —— 更新时顺手收走。
+fn archive_stale_packages(options: &Options) {
+    let current = env!("CARGO_PKG_VERSION");
+    let archive = options.install_dir.join("updates").join("archive");
+
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        let profile = PathBuf::from(profile);
+        roots.push(profile.join("Desktop"));
+        roots.push(profile.join("Downloads"));
+    }
+
+    let mut moved = 0usize;
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let lowered = name.to_lowercase();
+            if !lowered.starts_with("aicrm-setup-") || !lowered.ends_with(".exe") {
+                continue;
+            }
+            // 与当前版本一致的那份留着（客户可能还要拿它装别的机器）
+            let version = lowered
+                .trim_start_matches("aicrm-setup-")
+                .trim_end_matches(".exe");
+            if version == current {
+                continue;
+            }
+            if std::fs::create_dir_all(&archive).is_err() {
+                continue;
+            }
+            if std::fs::rename(&path, archive.join(name)).is_ok() {
+                moved += 1;
+            }
+        }
+    }
+    if moved > 0 {
+        log(
+            &options.log_file(),
+            &format!("已归档 {moved} 个过期安装包到 {}", archive.display()),
+        );
+    }
 }
 
 /// 删掉陈旧的 AICRM 快捷方式。
