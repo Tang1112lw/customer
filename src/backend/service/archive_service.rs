@@ -38,7 +38,7 @@ pub(crate) const ARCHIVE_PROGRAM: &str = super::export_service::EXPORT_PROGRAM;
 const ARCHIVE_SCHEMA: &str = "aicrm-chat-archive/v2";
 
 /// 导出超时。聊天库大时这个程序会跑很久。
-const ARCHIVE_TIMEOUT: Duration = Duration::from_secs(3600);
+const ARCHIVE_TIMEOUT: Duration = Duration::from_secs(1800);
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

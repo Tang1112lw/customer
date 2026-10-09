@@ -72,7 +72,7 @@ impl Service {
             args.extend(["--day".into(), day.to_string()]);
         }
         let result = self
-            .run(EXPORT_PROGRAM, args, Duration::from_secs(3600))
+            .run(EXPORT_PROGRAM, args, Duration::from_secs(1800))
             .await;
         // 只清理临时任务目录。云端指定的目录不能因为一次失败就删掉 ——
         // 那可能是用户/云端正在用的真实数据目录。
