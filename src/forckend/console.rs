@@ -24,6 +24,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod shell;
+mod single;
 mod theme;
 
 use eframe::egui;
@@ -59,8 +60,10 @@ fn main() -> eframe::Result {
 
     // 开机自启走这条：只进托盘，不弹窗口
     let hidden = arguments.iter().any(|item| item == "--hidden");
-    // 单实例：已经有一个在跑就直接退出，避免托盘点一次开一个窗口
-    if another_instance_running() {
+    // 单实例：已经有一个界面在跑就把它叫到前台，自己退出 —— 不静默消失，
+    // 也不许并排开第二个窗口（主界面与安装器共用同一把锁，所以也不会同时出现）。
+    if !single::acquire() {
+        single::activate_existing();
         return Ok(());
     }
 
@@ -262,21 +265,6 @@ fn stop_service() {
 ///
 /// 没有用互斥量：托盘每次点击都会拉起一次程序，开出一串窗口是必然的事故，
 /// 这个检查足够挡住，而且不引入额外的依赖。
-fn another_instance_running() -> bool {
-    Command::new("tasklist")
-        .args(["/FI", "IMAGENAME eq aicrm-console.exe", "/NH"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter(|line| line.to_lowercase().contains("aicrm-console.exe"))
-                .count()
-                >= 2
-        })
-        .unwrap_or(false)
-}
-
 fn service_up() -> bool {
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8765);
     TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok()
@@ -510,6 +498,11 @@ struct Console {
     tray_failed: bool,
     /// 窗口是否可见 —— 视口隐藏后 egui 不会回头告诉我们，自己记一份
     visible: bool,
+    /// 是否由本窗口托管本地服务：开着就"没起就拉起、掉了就重启"。
+    ///
+    /// 用户手动点「停止服务」时置 false —— 那是明确的手停，不该被自动拉起来
+    /// 打脸；再点「启动服务」或重开窗口才恢复托管。
+    auto_service: bool,
     /// 当前页，由侧边栏切换
     page: Page,
     /// 右上角账号菜单是否展开
@@ -529,6 +522,8 @@ impl Console {
             tray: None,
             tray_failed: false,
             visible,
+            // 默认托管：打开窗口就等于"服务该在跑"，掉了自动拉回来。
+            auto_service: true,
             page: Page::default(),
             account_menu: false,
         }
@@ -537,6 +532,23 @@ impl Console {
     fn refresh(&mut self) {
         self.snap = snapshot();
         self.refreshed = Some(Instant::now());
+        self.keep_service_alive();
+    }
+
+    /// 托管本地服务：没在跑就拉起来，跑着就什么都不做。
+    ///
+    /// 这是每 5 秒一次的常规刷新里顺带做的 —— 服务是采集和心跳的载体，它掉了
+    /// 云端立刻把这台设备标成离线，网页端也就点不动"绑定微信"。以前只能靠用户
+    /// 自己发现状态栏变红再手点启动，等于把可用性押在用户盯着看上。
+    fn keep_service_alive(&mut self) {
+        if !self.auto_service || self.snap.service_up {
+            return;
+        }
+        if let Err(error) = service_command().spawn() {
+            self.note = Some(format!("本地服务拉起失败：{error}"));
+        } else {
+            self.note = Some("本地服务已自动拉起".to_owned());
+        }
     }
 
     /// 显示 / 隐藏主窗口。隐藏不是退出，进程和托盘都还在。
@@ -842,10 +854,13 @@ impl Console {
                     if self.snap.service_up {
                         if theme::danger_button(ui, "停止服务").clicked() {
                             stop_service();
-                            self.note = Some("已发送停止指令".to_owned());
+                            // 手停就是手停，别再自动把它拉回来。
+                            self.auto_service = false;
+                            self.note = Some("已停止服务（不再自动拉起）".to_owned());
                             self.refresh();
                         }
                     } else if theme::primary_button(ui, "启动服务").clicked() {
+                        self.auto_service = true;
                         match service_command().spawn() {
                             Ok(_) => self.note = Some("正在启动服务…".to_owned()),
                             Err(error) => self.note = Some(format!("启动失败：{error}")),

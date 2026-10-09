@@ -25,10 +25,7 @@
     # 留空则自动判定：开发机用 src\tools，部署包用脚本同级的 tools\。
     [string]$ToolSource = '',
     # Markdown 导出程序。默认在 ToolSource 里找；找不到就报错，不静默降级。
-    [string]$ExportProgram = '',
-    # 归档导出程序（出 messages.json）。数据采集（wechat.collect / POST /api/aicrm/collect）
-    # 依赖它；默认在 ToolSource 里找 AICRM-Export.exe。
-    [string]$ArchiveProgram = ''
+    [string]$ExportProgram = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -83,15 +80,6 @@ if (-not $ExportProgram) {
 if (-not (Test-Path -LiteralPath $ExportProgram -PathType Leaf)) {
     throw "找不到 Markdown 导出程序：$ExportProgram（用 -ExportProgram 指定路径）"
 }
-# 归档导出程序。数据采集要用它出 messages.json；少了它本地接口仍然活着，
-# 但一点「数据采集」就报「辅助程序启动失败」—— 这种"装得上、用不了"的故障
-# 最难排查，所以宁可安装时就拦住。
-if (-not $ArchiveProgram) {
-    $ArchiveProgram = Join-Path $ToolSource 'AICRM-Export.exe'
-}
-if (-not (Test-Path -LiteralPath $ArchiveProgram -PathType Leaf)) {
-    throw "找不到归档导出程序：$ArchiveProgram（用 -ArchiveProgram 指定路径）。数据采集依赖它，不能省略。"
-}
 
 # 开发机从源码构建；部署包里没有 Cargo.toml，直接用随包的可执行文件。
 $manifest = Join-Path $PSScriptRoot 'Cargo.toml'
@@ -101,9 +89,14 @@ if (Test-Path -LiteralPath $manifest) {
 }
 
 New-Item -ItemType Directory -Force -Path $InstallDir, $tools, $data | Out-Null
-$existing = Get-CimInstance Win32_Process -Filter "Name = 'aicrm_windows_api.exe'" |
-    Where-Object { $_.ExecutablePath -eq $exe }
-foreach ($process in $existing) { Stop-Process -Id $process.ProcessId -Force }
+# 覆盖前必须停掉还在跑的旧进程：界面和托盘开着的时候，Copy-Item 会直接撞上
+# "文件正由另一进程使用" 而中断安装。安装器自身不在列表里 —— 停自己会让脚本当场断掉。
+foreach ($name in @('aicrm_windows_api.exe', 'aicrm-console.exe', 'aicrm-login.exe', 'aicrm-tray.exe')) {
+    Get-CimInstance Win32_Process -Filter "Name = '$name'" |
+        Where-Object { $_.ExecutablePath -like "$InstallDir*" } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+}
+Start-Sleep -Seconds 1    # 给系统一点时间把文件句柄放掉
 
 Copy-Item -LiteralPath $exeSource -Destination $exe -Force
 Copy-Item -LiteralPath $loginSource -Destination $loginExe -Force
@@ -111,8 +104,6 @@ Copy-Item -LiteralPath $consoleSource -Destination $consoleExe -Force
 # 服务启动时会校验 tools 目录里这两个程序存在；名字必须与 service 模块里的常量一致。
 Copy-Item -LiteralPath (Join-Path $ToolSource 'AICRM-Key.exe') -Destination (Join-Path $tools 'AICRM-Key.exe') -Force
 Copy-Item -LiteralPath $ExportProgram -Destination (Join-Path $tools 'aicrm-export-new.exe') -Force
-# AICRM-Export.exe 只在采集时用，不在启动校验里 —— 但少了它采集必失败，所以一并复制。
-Copy-Item -LiteralPath $ArchiveProgram -Destination (Join-Path $tools 'AICRM-Export.exe') -Force
 
 # 本地 API 的 Bearer token（安装时生成一次，之后不换）
 if (-not (Test-Path -LiteralPath $tokenFile)) {

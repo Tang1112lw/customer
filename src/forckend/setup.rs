@@ -19,6 +19,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod cloud;
+mod single;
 // 共用外观模块：本窗口只用到其中一部分（卡片 / 按钮 / 状态胶囊），
 // 侧边栏那套是主窗口在用；共享模块里存在本窗口不引用的项是正常的。
 #[allow(dead_code)]
@@ -57,6 +58,13 @@ fn main() -> eframe::Result {
             }
         }
         std::process::exit(0);
+    }
+
+    // 与主界面共用一把锁：安装器和客户端不许并排出现。已经有一个界面在跑就
+    // 把它叫到前台，自己退出。
+    if !single::acquire() {
+        single::activate_existing();
+        return Ok(());
     }
 
     let endpoint = arguments
@@ -465,6 +473,8 @@ impl SetupApp {
                 self.state = State::Done(message);
                 // 装完直接把客户端拉起来：用户点完「安装」最期待看到的就是它，
                 // 停在一个"安装成功"的静止页面上反而让人以为没生效。
+                // 先把自己的单实例名额放掉 —— 不然客户端一启动就被这把锁挡回去。
+                single::release();
                 match open_console() {
                     // 客户端已经出面了，安装窗口就没必要继续占着任务栏 ——
                     // 两个窗口并排摆着，用户会以为装了两遍。

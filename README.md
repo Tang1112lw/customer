@@ -10,16 +10,18 @@
 | --- | --- | --- | --- |
 | `aicrm_windows_api` | `src/main.rs` | 后台服务：HTTP 接口 + 云端命令通道 | 无界面，由 `HKCU\...\Run` 隐藏启动 |
 | `aicrm-login` | `src/forckend/main.rs` | 登录窗口（egui） | `--endpoint` / `--token-file` / `--device-file`，见下 |
-| `aicrm-console` | `src/forckend/console.rs` | 主窗口：一屏看状态（服务/登录/微信/云端）+ 启停服务 + 去登录 | 无参数；`--start-service` 只起服务不显示窗口 |
+| `aicrm-console` | `src/forckend/console.rs` | 主窗口：侧边栏 + 状态总览（云端 / 密钥 / 服务）+ 配置页 + 账号菜单；**托管本地服务** | 无参数；`--hidden` 只进托盘不弹窗；`--start-service` 只起服务不显示窗口 |
 | `aicrm-tray` | `src/forckend/tray.rs` | 系统托盘：看服务状态、打开主界面、启停服务、退出 | `--bind` / `--data-dir`；退出时会一并 `taskkill` 掉后台服务 |
 | `aicrm-setup` | `src/forckend/setup.rs` | 图形一键安装：登录云端 → 自动申领配对码 → 调 `install.ps1` 装盘 | `--endpoint`；`--extract-only` 自检内嵌载荷。单文件形态由 `aicrm-pack` 拼出 |
 | `aicrm-pack` | `src/pack/main.rs` | 打包工具：安装器 + 全部载荷 → 单文件安装程序 | `cargo run --release --bin aicrm-pack [输出路径]` |
 
-三件事值得记一笔：
+四件事值得记一笔：
 
 - **外观统一**：`src/forckend/theme.rs` 是三个窗口共用的外观（浅色底、白卡片、描边、留白），各自 `mod theme;` 指向同一份文件，不引入共享库。
 - **主窗口不依赖服务**：它直接读安装目录里的文件（令牌、密钥、`cloud.url`、`data/jobs`），因为它的职责之一就是"服务没跑时把服务拉起来"。宽高固定、长文本截断，避免窄窗口把中文挤成竖排。
-- **单文件安装程序**：`aicrm-pack` 把 `aicrm-setup.exe` 与载荷 zip 拼在一起，页脚 `[offset u64][len u64]["AICRMSFX"]`；安装器启动时读自身末尾定位并解压载荷，没有页脚就退回"同目录"布局。载荷清单在 `src/pack/main.rs` 顶部。
+- **单文件安装程序**：`aicrm-pack` 把 `aicrm-setup.exe` 与载荷 zip 拼在一起，页脚 `[offset u64][len u64]["AICRMSFX"]`；安装器启动时读自身末尾定位并解压载荷，没有页脚就退回"同目录"布局。载荷清单在 `src/pack/main.rs` 顶部。输出名是 `AICRM-<版本号>.exe`，版本号取自 `Cargo.toml`，不用手工同步。
+- **一个时间只有一个界面**：`src/forckend/single.rs` 用命名互斥体 `Local\AICRM.WinClient` 做单实例，主界面与安装器**共用同一把锁**，所以两者不会并排出现。重复启动时把已有窗口 `SW_RESTORE` + 置前，而不是再开一个。开窗前先 `acquire()`；安装器装完要拉起主界面前必须 `release()`，否则主界面会被自己那把锁挡掉（表现为"装完了但客户端弹不出来"）。
+- **打开客户端 = 服务就该在跑**：主窗口启动时托管 `aicrm_windows_api.exe`，每 5 秒的刷新里检查一次，没起就拉起、掉了就重启。用户手点「停止服务」时置 `auto_service=false` 不再自动拉起，点「启动服务」恢复。服务是采集和心跳的载体，它一掉云端立刻把设备标离线，网页端也就点不动「绑定微信」。
 
 托盘图标颜色就是服务状态（绿=运行中、灰=已停止），菜单里「令牌」一项看 `api.token` 是否非空；「服务在不在」是直接连 `--bind` 端口判定的，比查进程名更能说明"到底能不能用"。
 
@@ -30,6 +32,19 @@
 接入云端命令通道用 `./install.ps1 -CloudUrl <云端基地址> -DeviceId <云端签发的设备 ID> -ProvisionCode <预置码>`；客户网页是云端域名时再加 `-AllowOrigin <域名>`（可重复或逗号分隔）。安装脚本会把云端地址写进 `%LOCALAPPDATA%\AICRM-Windows-API\cloud.url`，隧道地址变了只改这个文件再重启服务，不用重装。
 
 采集闭环只依赖 `aicrm-export-new.exe`，它由 `install.ps1 -ExportProgram` 复制进 `tools\`，也是 `Service::new` 的启动校验项，缺它服务起不来。不再依赖 `AICRM-Export.exe`。
+
+### 换云端 / 重装前必读：设备身份有两处
+
+云端认的是 `--device-id`，它出现在**两个地方**，必须一致，否则心跳恒定 `401 Unauthorized`：
+
+1. `%LOCALAPPDATA%\AICRM-Windows-API\device.id` 与 `device.token`
+2. **`HKCU Run\AICRM-Windows-API` 自启项里写死的 `--device-id`** ← 最容易漏，改了文件不重装是没用的
+
+而且 `install.ps1` **只在传了 `-CloudUrl` 时**才把 `--cloud-url-file` / `--device-token-file` / `--device-id` 拼进启动参数和自启项。不带 `-CloudUrl` 装出来的服务根本不连云端。
+
+已接入云端时重装**不需要再配对**（`device.token` 存在就会沿用），但**仍要带 `-CloudUrl`**，否则自启项里没有云端参数。确认彻底换云端才删 `device.id` + `device.token` 重新走配对。
+
+验通标准：云端设备列表里这台从 `never_seen` 变成 `offline` / `online`。仍是 `never_seen` 就看 `client.err.log` 有没有 `401 Unauthorized`。
 
 `./uninstall.ps1` 只删除登录自启项并停止服务，保留程序、密钥、token 和导出文件。手动启动命令可查看 `install.ps1` 写入的 `HKCU:\Software\Microsoft\Windows\CurrentVersion\Run\AICRM-Windows-API` 值。
 
