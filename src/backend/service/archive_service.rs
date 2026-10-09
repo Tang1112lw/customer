@@ -117,6 +117,18 @@ impl Service {
         let _ = fs::remove_dir_all(&work);
         fs::create_dir_all(&work).map_err(|_| ApiError::io())?;
 
+        // 先报一声「活儿收到了」。这一步之后如果再无音信，云端就能断定
+        // 卡在导出上，而不是浏览器压根没调到本机。
+        report_task_progress(
+            &request,
+            "exporting",
+            10,
+            &match (&request.start, &request.end) {
+                (Some(start), Some(end)) => format!("已收到采集请求，开始导出 {start} 至 {end}"),
+                _ => "已收到采集请求，开始导出全部历史".to_owned(),
+            },
+        );
+
         // 导出 Markdown：JSON 给流水线、Markdown 给人看的老分工已经取消，
         // 现在一份 Markdown 同时满足人工查阅与 AI 分析。
         self.run_archive_program(ARCHIVE_PROGRAM, &work, &request)
@@ -133,6 +145,18 @@ impl Service {
         .map_err(|_| ApiError::io())?
         .map_err(|message| ApiError::helper(message))?;
 
+        let conversation_count = bundle
+            .get("exports")
+            .and_then(|value| value.as_array())
+            .map(|items| items.len())
+            .unwrap_or(0);
+        report_task_progress(
+            &request,
+            "exporting",
+            35,
+            &format!("导出完成，已打包 {conversation_count} 个会话，准备上传"),
+        );
+
         // ③ 上传
         let payload =
             serde_json::to_vec(&bundle).map_err(|_| ApiError::helper("归档序列化失败"))?;
@@ -140,6 +164,13 @@ impl Service {
         let token = request.execution_token.clone();
         let user_token = request.user_token.clone();
         let task_id = request.task_id.clone();
+        report_task_progress(
+            &request,
+            "uploading",
+            60,
+            &format!("正在上传归档包（{} 字节）", payload.len()),
+        );
+
         let mut outcome =
             run_blocking(move || upload_archive(&upload_url, &token, &user_token, &task_id, payload))
                 .await;
@@ -329,6 +360,36 @@ fn count_markdown_messages(markdown: &str) -> usize {
         .lines()
         .filter(|line| line.trim_start().starts_with("- "))
         .count()
+}
+
+/// 上报一次采集进度。
+///
+/// 存在的理由：以前只有失败才联系云端，客户端一旦卡在导出里（导出程序 hang、
+/// 微信没运行、数据目录读不到），云端看到的永远是「任务已创建」—— 分不清到底是
+/// 浏览器没调到本机、还是导出卡死了，只能靠人到机器上翻目录。
+/// 阶段与进度走云端已有白名单（checking_module / downloading / exporting / uploading，0-75）。
+///
+/// 上报失败只打日志：进度是给人看的诊断信息，不能因为它把真正的采集打断。
+fn report_task_progress(request: &ArchiveRequest, stage: &str, progress: i32, message: &str) {
+    let Some(base) = request.upload_url.strip_suffix("/upload") else {
+        return;
+    };
+    let status_url = format!("{base}/status");
+    let payload = json!({
+        "status": "running",
+        "stage": stage,
+        "progress": progress,
+        "message": message,
+    })
+    .to_string();
+    let sent = ureq::post(&status_url)
+        .header("X-Execution-Token", &request.execution_token)
+        .header("Authorization", &format!("Bearer {}", request.user_token))
+        .header("Content-Type", "application/json")
+        .send(payload.as_bytes());
+    if let Err(error) = sent {
+        eprintln!("采集进度上报失败（{error}）：{message}");
+    }
 }
 
 /// 通知云端「这次采集失败了」。
