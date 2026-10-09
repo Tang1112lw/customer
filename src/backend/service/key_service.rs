@@ -61,7 +61,7 @@ impl Service {
             args.push("--no-restart".into());
         }
         let mut result = self
-            .run(KEY_PROGRAM, args, Duration::from_secs(1200))
+            .run(KEY_PROGRAM, args, Duration::from_secs(600))
             .await?;
         if let Some(object) = result.as_object_mut() {
             object.remove("key_word");

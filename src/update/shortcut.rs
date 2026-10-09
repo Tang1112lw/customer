@@ -19,9 +19,9 @@ pub fn refresh(install_dir: &Path, log_file: &Path) -> Result<(), String> {
     if !target.is_file() {
         return Err(format!("找不到主程序：{}", target.display()));
     }
-    let roots = shortcut_roots();
+    let roots = cleanup_roots();
     let removed = cleanup_links(&roots, install_dir);
-    let created = write_links(&roots, &target, install_dir);
+    let created = write_links(&entry_roots(), &target, install_dir);
     let archived = archive_stale_packages(&roots, install_dir, log_file);
     log(
         log_file,
@@ -36,8 +36,26 @@ pub fn refresh(install_dir: &Path, log_file: &Path) -> Result<(), String> {
 
 // ---------------------------------------------------------------- 目录
 
-/// 快捷方式所在目录。只碰这几个已知位置，不做全盘搜索。
-fn shortcut_roots() -> Vec<PathBuf> {
+/// 写入口的位置：**只写用户自己的桌面与开始菜单**。
+///
+/// 千万不要往公共位置（`%PUBLIC%\Desktop`、`%ProgramData%\...\Start Menu`）也写一份：
+/// Windows 会把用户桌面与公共桌面**合并成一个视图**，两边各一份就会在同一个桌面上
+/// 显示成两个一模一样的 AICRM —— 实测被客户当场指出过。
+fn entry_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(home) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+        roots.push(home.join("Desktop"));
+    }
+    if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
+        roots.push(appdata.join("Microsoft/Windows/Start Menu/Programs"));
+    }
+    roots.retain(|path| path.is_dir());
+    roots
+}
+
+/// 需要清理与归档的位置：用户 + 公共的桌面/开始菜单，外加下载目录。
+/// 公共位置上的入口只能清、不能写（理由见 `entry_roots`）。
+fn cleanup_roots() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Some(home) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
         roots.push(home.join("Desktop"));

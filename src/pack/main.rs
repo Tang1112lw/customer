@@ -58,8 +58,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = std::env::args()
         .nth(1)
         .map(PathBuf::from)
-        // 对外只叫 AICRM：文件名里不带 Setup、也不带版本号（版本在程序内部右下角）。
-        .unwrap_or_else(|| release.join("AICRM.exe"));
+        // 安装程序与程序入口必须能一眼分开：入口是 AICRM（快捷方式），
+    // 分发用的安装程序叫 AICRM-安装程序.exe —— 同名同图标会让桌面看起来
+    // 有两个一模一样的 AICRM（实测挨过批）。
+        .unwrap_or_else(|| release.join("AICRM-安装程序.exe"));
 
     // ① 组载荷 zip
     let mut payload: Vec<u8> = Vec::new();

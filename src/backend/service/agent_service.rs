@@ -497,10 +497,14 @@ async fn execute(service: &Service, config: &CloudConfig, command: &Command) -> 
         // 取密钥。注意：密钥缺失时辅助程序**可能重启微信**，云端只应在确认客户在场时下发。
         "wechat.bind" => match decode::<PrepareRequest>(command) {
             Err(report) => report,
-            Ok(request) => match service.prepare(request).await {
-                Ok(data) => Report::ok(data),
-                Err(error) => Report::failed(error.code(), error.message()),
-            },
+            Ok(request) => {
+                // 先报一条，让网页端立刻从「没反应」变成「正在检测本机微信…」。
+                report_command_progress(config, command, 3, "已收到绑定请求，正在检测本机微信…").await;
+                match service.prepare(request).await {
+                    Ok(data) => Report::ok(data),
+                    Err(error) => Report::failed(error.code(), error.message()),
+                }
+            }
         },
         "wechat.export" => match decode::<ExportRequest>(command) {
             Err(report) => report,
@@ -604,6 +608,32 @@ fn cloud_result(command: &Command, outcome: &Report) -> Value {
         );
     }
     Value::Object(body)
+}
+
+/// 命令执行期间的进度上报。
+///
+/// 取密钥最长要几分钟，而云端原先只看得到「领走」和「最终结果」两个状态 ——
+/// 中间什么都不报，网页端就是「点了没反应」。这里只负责让人看见「在跑」，
+/// 上报失败一律忽略：它是可观测性，不是命令本身的一部分。
+async fn report_command_progress(config: &CloudConfig, command: &Command, progress: i32, message: &str) {
+    let config = config.clone();
+    let command_id = command.id.clone();
+    let message = message.to_owned();
+    let _ = blocking(move || {
+        let endpoint = format!(
+            "{}/api/agent/v1/commands/{command_id}/progress",
+            config.base_url()
+        );
+        let body = serde_json::json!({ "progress": progress, "message": message }).to_string();
+        let _ = agent()
+            .put(&endpoint)
+            .header("Authorization", &format!("Device {}", config.device_token))
+            .header("X-AICRM-Device-ID", &config.device_id)
+            .header("Content-Type", "application/json")
+            .send(body.as_str());
+        Ok::<(), ApiError>(())
+    })
+    .await;
 }
 
 async fn report(config: &CloudConfig, command: &Command, outcome: Report) -> ApiResult<()> {
