@@ -103,7 +103,10 @@ impl Service {
         // 起点取上次那天而不是次日，多采一天由云端去重兜住，少采一天就是永久缺口。
         if request.start.is_none() && request.end.is_none() && request.day.is_none() {
             if let Some(mark) = self.state.watermark(&owner) {
+                // 水位线只给了起点，终点必须是今天：导出程序要求 --start / --end 成对出现，
+                // 只给 start 会被它判成参数错误（实测「--start 与 --end 必须同时指定」）。
                 request.start = Some(mark.date);
+                request.end = Some(today());
             }
         }
 

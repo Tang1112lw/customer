@@ -310,6 +310,13 @@ pub(crate) fn now_rfc3339() -> String {
 }
 
 /// 今天的日期，`YYYY-MM-DD`。水位线用这个粒度，与导出程序的 `--start` 一致。
+///
+/// 按东八区计算：导出程序把 `--start` / `--end` 理解成本地日期，而 `rfc3339`
+/// 输出的是 UTC —— 直接用会在这边早上八点前把「今天」算成昨天，导致当天数据漏采。
 pub(crate) fn today() -> String {
-    now_rfc3339()[..10].to_owned()
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0);
+    rfc3339(seconds + 8 * 3600)[..10].to_owned()
 }
