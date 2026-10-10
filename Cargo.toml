@@ -8,12 +8,8 @@ edition = "2024"
 name = "aicrm_windows_api"
 path = "src/main.rs"
 
-# 登录窗口：图形程序，用户手动打开，换取云端会话令牌
-[[bin]]
-name = "aicrm-login"
-path = "src/forckend/main.rs"
-
 # 主窗口：一屏看状态（服务/登录/微信/云端），启停服务，并常驻通知区托盘。
+# 登录与首次「连接云端」配对也在这一窗口内完成（不再有独立的登录窗口）。
 # 点 × 只隐藏窗口不退出，真正的退出在托盘菜单里。
 [[bin]]
 name = "aicrm-console"

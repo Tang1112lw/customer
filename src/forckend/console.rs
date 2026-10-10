@@ -28,11 +28,19 @@ mod shell;
 mod single;
 mod theme;
 
+#[path = "../shared/mod.rs"]
+mod shared;
+
+use shared::{
+    device,
+    paths::{self, install_dir},
+};
+
 use eframe::egui;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
     os::windows::process::CommandExt,
-    path::{Path, PathBuf},
+    path::Path,
     process::Command,
     sync::{mpsc, Arc, Mutex},
     time::{Duration, Instant, SystemTime},
@@ -114,14 +122,6 @@ fn install_cjk_font(ctx: &egui::Context) {
             .push("cjk".to_owned());
     }
     ctx.set_fonts(fonts);
-}
-
-/// 安装目录：与服务、登录窗口用的是同一个约定。
-fn install_dir() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("AICRM-Windows-API")
 }
 
 /// 启动后台服务的命令。参数与 `install.ps1` 写进自启项的完全一致，
@@ -218,43 +218,6 @@ fn read_trimmed(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// 打开登录窗口；云端地址已配置时直接带上，省得用户再输。
-///
-/// 登录界面是**独立进程**（aicrm-login.exe），所以这里必须先查重 ——
-/// 否则用户点几次「重新登录」就会堆出几个一模一样的窗口。
-fn open_login() {
-    const TITLE: &str = "AICRM 登录";
-    let wide: Vec<u16> = TITLE.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: 传入以 NUL 结尾的宽字符串；窗口类传空表示只按标题查找。
-    let existing = unsafe {
-        windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(std::ptr::null(), wide.as_ptr())
-    };
-    if !existing.is_null() {
-        unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
-                existing,
-                windows_sys::Win32::UI::WindowsAndMessaging::SW_RESTORE,
-            );
-            windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(existing);
-        }
-        return;
-    }
-
-    let dir = install_dir();
-    let mut command = Command::new(dir.join("aicrm-login.exe"));
-    let url = read_trimmed(&dir.join("cloud.url"));
-    if !url.is_empty() {
-        command
-            .arg("--endpoint")
-            .arg(format!("{}/api/auth/login", url.trim_end_matches('/')))
-            .arg("--token-file")
-            .arg(dir.join("api.token"))
-            .arg("--device-file")
-            .arg(dir.join("device.id"));
-    }
-    let _ = command.spawn();
-}
-
 fn stop_service() {
     let _ = Command::new("taskkill")
         .args(["/IM", "aicrm_windows_api.exe", "/F"])
@@ -280,14 +243,53 @@ fn stop_other_client_processes() {
 ///
 /// 没有用互斥量：托盘每次点击都会拉起一次程序，开出一串窗口是必然的事故，
 /// 这个检查足够挡住，而且不引入额外的依赖。
-/// 连接云端：登录 → 申领配对码 → 交给 install.ps1 完成配对。
+/// 连接云端：登录 → 令牌落盘 →（未配对时）申领配对码并交给安装脚本。
 ///
-/// 配对这一步复用安装脚本而不是在 Rust 里重写：令牌生成（`New-HexToken`）、
-/// 收紧文件权限、**重写开机自启项里的 `--device-id`**、重启服务 —— 这些都在那边
-/// 验证过了。漏掉"重写自启项"这一条，下次开机就会用回旧身份、恒定 401。
+/// 首次配对与「重新登录」走同一条路：先把会话令牌写进本地 —— 心跳把它作为
+/// `X-AICRM-User-Token` 上送，云端据此决定"哪个账号的网页端看得见这台客户端"。
+/// 已配对的机器到这里就结束了（只换令牌）；没配对的再申领配对码，
+/// 由安装脚本完成设备身份落盘与自启项注册。
+///
+/// 配对复用安装脚本而不是在 Rust 里重写：令牌生成（`New-HexToken`）、
+/// 收紧文件权限、重启服务 —— 这些都在那边验证过了。
 fn connect_task(base: &str, username: &str, password: &str) -> Result<String, String> {
-    let session = cloud::login(&format!("{base}/api/auth/login"), username, password, "console")
-        .map_err(|error| error.message().to_owned())?;
+    let session = cloud::login(
+        &format!("{base}/api/auth/login"),
+        username,
+        password,
+        &device::device_id(&paths::device_id()),
+    )
+    .map_err(|error| error.message().to_owned())?;
+
+    // 令牌先落盘，再谈配对：这条路对"已配对机器重新登录"同样成立。
+    if let Some(name) = session.display_name.as_deref() {
+        let _ = device::save_account(&paths::account_name(), name);
+    }
+    let warning = match device::save_token(&paths::api_token(), &session.access_token) {
+        Ok(notice) => notice,
+        Err(error) => return Err(format!("令牌写入失败：{error}")),
+    };
+    // 刷新令牌一并落盘：access token 只有 2 小时，服务靠它自动续期。
+    if let Some(refresh) = session.refresh_token.as_deref() {
+        let _ = device::save_token(&paths::api_refresh(), refresh);
+    }
+
+    let who = session
+        .display_name
+        .unwrap_or_else(|| username.to_owned());
+
+    if paired() {
+        // 已配对：换令牌就是全部工作。服务启动时读一次令牌，重启才换得掉。
+        if service_up() {
+            stop_service();
+        }
+        let mut message = format!("已登录：{who}。服务将用新令牌重启");
+        if let Some(notice) = warning {
+            message.push_str(&format!("（{notice}）"));
+        }
+        return Ok(message);
+    }
+
     let provision = cloud::create_provision(base, &session.access_token)?;
 
     let script = install_dir().join("install.ps1");
@@ -303,8 +305,6 @@ fn connect_task(base: &str, username: &str, password: &str) -> Result<String, St
         .arg(&provision.device_id)
         .arg("-ProvisionCode")
         .arg(&provision.provision_code)
-        .arg("-Endpoint")
-        .arg(format!("{base}/api/auth/login"))
         .arg("-AllowOrigin")
         .arg(base)
         // 别让脚本把调用它的我们停掉（脚本默认会停 console 以便覆盖文件）。
@@ -330,7 +330,7 @@ fn connect_task(base: &str, username: &str, password: &str) -> Result<String, St
 /// 判据是 `device.token` 在不在 —— 它是设备身份的凭据，没有它服务上报会被云端
 /// 直接拒（401），所以首次打开必须先把它办下来。
 fn paired() -> bool {
-    let path = install_dir().join("device.token");
+    let path = paths::device_token();
     std::fs::read_to_string(&path)
         .map(|text| text.trim().len() >= 32)
         .unwrap_or(false)
@@ -338,7 +338,7 @@ fn paired() -> bool {
 
 /// 云端基地址：装的时候写进 `cloud.url`，改服务器只改这个文件。
 fn cloud_base() -> String {
-    let url = read_trimmed(&install_dir().join("cloud.url"));
+    let url = read_trimmed(&paths::cloud_url());
     if url.is_empty() {
         "http://127.0.0.1:8081".to_owned()
     } else {
@@ -365,7 +365,7 @@ fn spawn_probe(slot: Arc<Mutex<Option<bool>>>) {
 
 /// 探一下云端根路径：能拿到任何 HTTP 响应就算通（404 也算，说明服务活着）。
 fn probe_cloud() -> Option<bool> {
-    let url = read_trimmed(&install_dir().join("cloud.url"));
+    let url = read_trimmed(&paths::cloud_url());
     if url.is_empty() {
         return None;
     }
@@ -490,13 +490,14 @@ fn decrypted_cache_ready(accounts: &std::path::Path, wxid: &str) -> bool {
         })
 }
 
-fn snapshot() -> Snapshot {    let dir = install_dir();
+fn snapshot() -> Snapshot {
+    let dir = install_dir();
     let mut snap = Snapshot {
         service_up: service_up(),
         ..Default::default()
     };
 
-    let token_path = dir.join("api.token");
+    let token_path = paths::api_token();
     if let Ok(text) = std::fs::read_to_string(&token_path) {
         let text = text.trim();
         if !text.is_empty() {
@@ -514,8 +515,8 @@ fn snapshot() -> Snapshot {    let dir = install_dir();
         }
     }
 
-    // 账号名由登录窗口写进 account.name；文件不在就是没登录
-    snap.account = std::fs::read_to_string(dir.join("account.name"))
+    // 账号名由登录流程写进 account.name；文件不在就是没登录
+    snap.account = std::fs::read_to_string(paths::account_name())
         .ok()
         .map(|text| text.trim().to_owned())
         .filter(|name| !name.is_empty());
@@ -584,8 +585,8 @@ fn snapshot() -> Snapshot {    let dir = install_dir();
         snap.wechat_name = self_name_from_exports(&dir.join("data").join("jobs"));
     }
 
-    let url = read_trimmed(&dir.join("cloud.url"));
-    let device = read_trimmed(&dir.join("device.id"));
+    let url = read_trimmed(&paths::cloud_url());
+    let device = read_trimmed(&paths::device_id());
     if !url.is_empty() && !device.is_empty() {
         snap.cloud = Some((url, device));
     }
@@ -802,15 +803,17 @@ impl Console {
     /// 不是删掉令牌文件 —— 服务启动时要求令牌至少 32 位可见字符，空文件会让服务
     /// 起不来；`device.token`（设备身份）更不能动，换了它就得重新配对。
     fn logout(&mut self) {
-        let dir = install_dir();
         let mut fresh = String::new();
         while fresh.len() < 64 {
             fresh.push_str(&uuid::Uuid::new_v4().simple().to_string());
         }
         fresh.truncate(64);
         // 顺手清掉账号名，右上角随即回到"未登录"
-        let _ = std::fs::remove_file(dir.join("account.name"));
-        match std::fs::write(dir.join("api.token"), fresh) {
+        let _ = std::fs::remove_file(paths::account_name());
+        // 刷新令牌必须一起删：续期任务只看 `api.refresh`，留着它的话，
+        // 30 分钟内服务会拿它换回一个有效令牌写进 `api.token` —— 退出登录会自己"登回来"。
+        let _ = std::fs::remove_file(paths::api_refresh());
+        match std::fs::write(paths::api_token(), fresh) {
             Ok(()) => {
                 // 服务把令牌读在内存里，重启才换得掉
                 if self.snap.service_up {
@@ -838,7 +841,7 @@ impl Console {
             self.editing = Some(draft);
             return;
         }
-        if let Err(error) = std::fs::write(install_dir().join("cloud.url"), &url) {
+        if let Err(error) = std::fs::write(paths::cloud_url(), &url) {
             self.note = Some(format!("写入失败：{error}"));
             self.editing = Some(draft);
             return;
@@ -1066,8 +1069,13 @@ impl Console {
                     .show(ui, |ui| {
                         ui.set_width(148.0);
                         if theme::ghost_button(ui, "重新登录").clicked() {
-                            open_login();
-                            self.note = Some("已打开登录窗口（服务需重启才读新令牌）".to_owned());
+                            // 登录在主控台内的连接页完成：登录成功后令牌落盘，
+                            // 服务自动用新令牌重启，不需要再开第二个窗口。
+                            self.connect.error = None;
+                            self.connect.step = None;
+                            self.connect.pending = None;
+                            self.connect.password.clear();
+                            self.page = Page::Connect;
                             close = true;
                         }
                         ui.add_space(4.0);
@@ -1137,9 +1145,21 @@ impl Console {
     /// 独立于主界面，不显示侧边栏 —— 这会儿"主界面/配置"都还没有意义，
     /// 连不上什么都是空的。
     fn connect_page(&mut self, ui: &mut egui::Ui) {
+        // 已配对又回到这一页 = 从账号菜单点了「重新登录」；首次打开则是「连接云端」。
+        let paired = paired();
         ui.vertical_centered(|ui| {
             ui.add_space(46.0);
-            ui.label(egui::RichText::new("连接云端").size(18.0).strong());
+            ui.label(
+                egui::RichText::new(if paired { "登录账号" } else { "连接云端" })
+                    .size(18.0)
+                    .strong(),
+            );
+            ui.add_space(6.0);
+            ui.label(theme::muted(if paired {
+                "换账号后，这台设备会自动归属到新账号"
+            } else {
+                "首次使用：登录一次，完成本机与云端的配对"
+            }));
         });
         ui.add_space(26.0);
 
@@ -1195,6 +1215,14 @@ impl Console {
                 }
             });
         });
+
+        // 明文传密码是这套方案最危险的失误，与独立登录窗时一样常驻提示。
+        if let Some(warning) = cloud::transport_warning(&cloud_base()) {
+            ui.add_space(12.0);
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new(warning).size(12.0).color(theme::BAD));
+            });
+        }
     }
 
     /// 配置页。只干一件事：改与云端的连接地址。

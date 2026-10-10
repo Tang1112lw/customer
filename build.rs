@@ -64,12 +64,7 @@ fn main() {
 
     // 每个会被分发出去的程序都带上图标（打包工具 aicrm-pack 不分发，不需要）。
     // 用 rustc-link-arg-bin 逐目标施加，避免影响测试等其它产物。
-    for bin in [
-        "aicrm_windows_api",
-        "aicrm-login",
-        "aicrm-console",
-        "aicrm-setup",
-    ] {
+    for bin in ["aicrm_windows_api", "aicrm-console", "aicrm-setup"] {
         println!("cargo:rustc-link-arg-bin={bin}={}", out.display());
     }
 }

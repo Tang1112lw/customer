@@ -31,9 +31,8 @@ const MAGIC: &[u8; 8] = b"AICRMSFX";
 /// 载荷布局：仓库里的脚本放根目录，编译产物和辅助程序各就各位。
 /// 少一个文件就直接报错 —— 装到一半才发现缺东西是最糟的情况。
 const SCRIPTS: [&str; 2] = ["install.ps1", "uninstall.ps1"];
-const BINARIES: [&str; 4] = [
+const BINARIES: [&str; 3] = [
     "aicrm_windows_api.exe",
-    "aicrm-login.exe",
     "aicrm-console.exe",
     "aicrm-update.exe",
 ];

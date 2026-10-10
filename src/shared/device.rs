@@ -1,10 +1,9 @@
-//! 本地持久化：设备标识与会话令牌。
+//! 设备标识与会话令牌的本地持久化。
+//!
+//! 由原 `forckend/store.rs` 并入：登录窗合并进主控台后，设备凭据的读写不再属于
+//! 某一个窗口，而是"谁登录谁写"的公共动作。
 
-use std::{
-    fs, io,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::{fs, io, path::Path, process::Command};
 
 /// 每台客户端唯一的设备标识，持久化后不再变化。
 ///
@@ -69,35 +68,9 @@ fn harden(path: &Path) -> Option<String> {
     }
 }
 
-/// 默认令牌文件位置，与 `install.ps1` 写入的位置一致。
-pub fn default_token_file() -> PathBuf {
-    install_dir().join("api.token")
-}
-
-/// 刷新令牌的位置：与 `api.token` 同目录，文件名固定 `api.refresh`。
-///
-/// access token 只有 2 小时，服务靠这个刷新令牌自动续期（见
-/// `backend::service::agent_service` 的续期任务）。登录时由登录窗口写入。
-pub fn default_refresh_file() -> PathBuf {
-    install_dir().join("api.refresh")
-}
-
-/// 默认设备标识文件位置。
-pub fn default_device_file() -> PathBuf {
-    install_dir().join("device.id")
-}
-
-/// 默认账号名文件位置。登录成功后由登录窗口写入，主界面读它来显示当前账号。
-///
-/// 单独存一个文件而不是塞进 `api.token`：令牌文件里只有 JWT 本身，不含账号信息，
-/// 而主界面右上角要显示"是谁登录的"。
-pub fn default_account_file() -> PathBuf {
-    install_dir().join("account.name")
-}
-
 /// 写入账号名。登录成功拿到 `display_name` 后调用。
 ///
-/// 只写不读 —— 读的那一头在 console.rs，它直接读这个文件，不经过本模块。
+/// 只写不读 —— 读的那一头在 console.rs 的快照里，它直接读这个文件。
 pub fn save_account(path: &Path, name: &str) -> io::Result<()> {
     let name = name.trim();
     if name.is_empty() {
@@ -109,9 +82,16 @@ pub fn save_account(path: &Path, name: &str) -> io::Result<()> {
     fs::write(path, name)
 }
 
-fn install_dir() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("AICRM-Windows-API")
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_id_is_stable_across_calls() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("device.id");
+        let first = device_id(&path);
+        assert_eq!(first.len(), 32);
+        assert_eq!(first, device_id(&path));
+    }
 }

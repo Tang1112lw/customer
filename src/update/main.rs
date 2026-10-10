@@ -25,10 +25,9 @@ mod shortcut;
 /// 允许被替换的文件白名单。收到名单外的文件名一律报错 ——
 /// 宁可这次更新失败，也不能把文件悄悄写到别的位置（实测踩过：把发布产物名
 /// 当成目标名，结果安装目录多出一个 agent-0.1.4.exe，主程序根本没换）。
-const ALLOWED_TARGETS: [&str; 4] = [
+const ALLOWED_TARGETS: [&str; 3] = [
     "aicrm_windows_api.exe",
     "aicrm-console.exe",
-    "aicrm-login.exe",
     "aicrm-update.exe",
 ];
 
@@ -190,10 +189,21 @@ fn apply(options: &Options) -> Result<(), String> {
         replaced.push(name.clone());
     }
 
-    // ③ 重启 → 确认活下来 → 刷新快捷方式 → 清标记
+    // ③ 重启 → 确认活下来 → 清理旧程序 → 刷新快捷方式 → 清标记
     log(&options.log_file(), "替换完成，重启客户端");
     start_clients(options)?;
     confirm_restart(options, &replaced, &backup)?;
+    // 已下线的旧程序顺手清掉：aicrm-login（登录已并入主控台）、aicrm-tray（更早已并入）。
+    // 失败只记日志 —— 文件占用之类不该让整次更新作废，下次更新还会再试。
+    for name in ["aicrm-login.exe", "aicrm-tray.exe"] {
+        let path = options.install_dir.join(name);
+        if path.is_file() {
+            match std::fs::remove_file(&path) {
+                Ok(()) => log(&options.log_file(), &format!("已清理旧程序 {name}")),
+                Err(error) => log(&options.log_file(), &format!("清理 {name} 失败：{error}")),
+            }
+        }
+    }
     // 快捷方式与过期安装包的收尾：失败不该让整次更新作废（exe 已经换好了），
     // 只记一行日志，下次启动还会再补一次。
     if let Err(error) = shortcut::refresh(&options.install_dir, &options.log_file()) {
@@ -216,6 +226,8 @@ fn apply(options: &Options) -> Result<(), String> {
 ///      系统索引都会拖住）。这里循环"杀→查→再杀"，直到确认干净（最多 15 秒）。
 fn stop_clients() {
     // 顺序：看守者在前，被看守的服务在最后。
+    // `aicrm-login` 已并入主控台、不再随包分发 —— 保留在名单里是为了覆盖
+    // 从旧版本升级的机器（更新那一刻旧登录窗可能还开着）。
     const ORDER: [&str; 3] = [
         "aicrm-console.exe",
         "aicrm-login.exe",

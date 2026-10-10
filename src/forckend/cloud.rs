@@ -253,53 +253,156 @@ pub fn create_provision(base_url: &str, access_token: &str) -> Result<Provision,
         .ok_or_else(|| "云端没有返回配对信息".to_owned())
 }
 
-/// 用配对码换设备身份。
-///
-/// 令牌在**本机**生成，云端只保存它的 SHA-256 —— 所以明文从不经过网络，
-/// 装完之后也只在本地盘上有一份（权限已收紧）。
-pub fn pair_device(
-    base_url: &str,
-    provision: &Provision,
-    device_token: &str,
-) -> Result<(), String> {
-    let url = format!("{}/api/agent/v1/provision", base_url.trim_end_matches('/'));
-    let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows".to_owned());
-    let body = serde_json::json!({
-        "deviceId": provision.device_id,
-        "code": provision.provision_code,
-        "deviceToken": device_token,
-        "name": name,
-    })
-    .to_string();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::mpsc::{Receiver, channel},
+    };
 
-    let agent: ureq::Agent = ureq::config::Config::builder()
-        .timeout_global(Some(Duration::from_secs(30)))
-        .http_status_as_error(false)
-        .build()
-        .into();
-    let mut response = agent
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .send(body.as_str())
-        .map_err(|error| format!("无法连接云端：{error}"))?;
+    /// 起一个只服务一次请求的假云端，返回它的 URL 和"收到的原始请求"的接收端。
+    fn mock_cloud(status_line: &'static str, body: &'static str) -> (String, Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = channel();
 
-    let status = response.status();
-    let text = response
-        .body_mut()
-        .read_to_string()
-        .map_err(|error| format!("读取响应失败：{error}"))?;
-    if !status.is_success() {
-        return Err(format!("配对失败（HTTP {status}）：{text}"));
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+
+            // 必须按 Content-Length 读满，单次 read 可能只拿到请求头。
+            let mut raw = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let read = stream.read(&mut chunk).unwrap();
+                if read == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&raw);
+                if let Some(head) = text.find("\r\n\r\n") {
+                    // 头部名大小写不敏感：ureq 发的是小写 content-length。
+                    let mut length = 0usize;
+                    for line in text[..head].lines() {
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.eq_ignore_ascii_case("content-length")
+                        {
+                            length = value.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    if raw.len() >= head + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let _ = sender.send(String::from_utf8_lossy(&raw).into_owned());
+
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        (format!("http://{address}/api/auth/login"), receiver)
     }
-    let decoded: serde_json::Value =
-        serde_json::from_str(&text).map_err(|_| "云端返回格式不符合预期".to_owned())?;
-    let done = decoded
-        .pointer("/data/provisioned")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    if done {
-        Ok(())
-    } else {
-        Err("云端未确认配对".to_owned())
+
+    #[test]
+    fn sends_credentials_as_json_and_reads_the_session() {
+        // 真实云端（TangHang POST /api/auth/login）的响应形状
+        let (endpoint, received) = mock_cloud(
+            "200 OK",
+            r#"{"code":0,"message":"success","data":{
+                "accessToken":"eyJhbGciOi.access","refreshToken":"eyJhbGciOi.refresh",
+                "user":{"user":{"name":"系统管理员","username":"admin"},"roles":[
+                    {"name":"admin","display_name":"管理员"}]}}}"#,
+        );
+
+        let session = login(&endpoint, "zhangsan", "hunter2", "device-1").unwrap();
+
+        assert_eq!(session.access_token, "eyJhbGciOi.access");
+        assert_eq!(session.refresh_token.as_deref(), Some("eyJhbGciOi.refresh"));
+        assert_eq!(session.display_name.as_deref(), Some("系统管理员"));
+
+        let request = received.recv().unwrap();
+        assert!(
+            request.starts_with("POST /api/auth/login HTTP/1.1"),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("content-type: application/json"),
+            "{request}"
+        );
+        // 关键：这个请求绝不能带 Authorization —— 它就是用来换取令牌的入口。
+        assert!(
+            !request.to_ascii_lowercase().contains("authorization:"),
+            "登录请求不应携带 Authorization 头：{request}"
+        );
+        let body = request.split("\r\n\r\n").nth(1).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(payload["username"], "zhangsan");
+        assert_eq!(payload["password"], "hunter2");
+        assert_eq!(payload["device_id"], "device-1");
+        assert!(payload["client_version"].is_string());
+    }
+
+    #[test]
+    fn falls_back_to_username_when_display_name_is_absent() {
+        let (endpoint, _) = mock_cloud(
+            "200 OK",
+            r#"{"code":0,"message":"success","data":{"accessToken":"tok","user":{"user":{"username":"admin"}}}}"#,
+        );
+        let session = login(&endpoint, "admin", "x", "device-1").unwrap();
+        assert_eq!(session.display_name.as_deref(), Some("admin"));
+        assert!(session.refresh_token.is_none());
+    }
+
+    #[test]
+    fn rejected_credentials_surface_the_cloud_message() {
+        // 真实云端的错误信封：{code, message, data:null}
+        let (endpoint, _) = mock_cloud(
+            "401 Unauthorized",
+            r#"{"code":401,"message":"账号或密码错误","data":null}"#,
+        );
+
+        let error = login(&endpoint, "zhangsan", "wrong", "device-1").unwrap_err();
+        assert!(matches!(error, LoginError::Rejected(_)), "{error:?}");
+        assert_eq!(error.message(), "账号或密码错误");
+    }
+
+    #[test]
+    fn success_envelope_without_data_is_a_protocol_error() {
+        let (endpoint, _) = mock_cloud("200 OK", r#"{"code":0,"message":"success","data":null}"#);
+        let error = login(&endpoint, "admin", "x", "device-1").unwrap_err();
+        assert!(matches!(error, LoginError::Protocol(_)), "{error:?}");
+    }
+
+    #[test]
+    fn server_fault_is_retryable_not_a_credential_problem() {
+        let (endpoint, _) = mock_cloud("500 Internal Server Error", r#"{"message":"boom"}"#);
+
+        let error = login(&endpoint, "zhangsan", "hunter2", "device-1").unwrap_err();
+        assert!(matches!(error, LoginError::Unreachable(_)), "{error:?}");
+    }
+
+    #[test]
+    fn non_contract_response_is_reported_as_protocol_error() {
+        let (endpoint, _) = mock_cloud("200 OK", r#"{"unexpected":true}"#);
+
+        let error = login(&endpoint, "zhangsan", "hunter2", "device-1").unwrap_err();
+        assert!(matches!(error, LoginError::Protocol(_)), "{error:?}");
+    }
+
+    #[test]
+    fn plain_http_to_a_remote_host_is_flagged() {
+        assert!(transport_warning("https://api.example.com/api/login").is_none());
+        // 本机联调不算问题
+        assert!(transport_warning("http://127.0.0.1:9000/api/login").is_none());
+        assert!(transport_warning("http://localhost:9000/api/login").is_none());
+        // 明文发到公网必须报警
+        assert!(transport_warning("http://api.example.com/api/login").is_some());
     }
 }

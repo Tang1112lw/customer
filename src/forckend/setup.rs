@@ -18,6 +18,9 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+// 共享模块里存在本窗口不引用的项是正常的：登录 / 配对那条路只在主控台里用，
+// 这里只用 transport_warning 提示"地址是 http 明文"。
+#[allow(dead_code)]
 mod cloud;
 mod single;
 // 共用外观模块：本窗口只用到其中一部分（卡片 / 按钮 / 状态胶囊），
@@ -25,7 +28,6 @@ mod single;
 #[allow(dead_code)]
 mod theme;
 
-// 静默安装不再需要登录：`cloud` 只用来提示"地址是 http 明文"这件事。
 use eframe::egui;
 use std::{
     io::{Read, Seek, SeekFrom},
@@ -225,47 +227,14 @@ fn remove_self_after_exit() {
     let _ = command.spawn();
 }
 
-/// 装完立刻把主窗口打开 —— 状态一目了然，登录也从那里进。
-/// 主窗口缺席（老版本装的）就退回直接开登录窗。失败不影响安装结果，因此忽略错误。
-fn open_main_window(base_url: &str) {
-    let Some(local) = std::env::var_os("LOCALAPPDATA") else {
-        return;
-    };
-    let dir = PathBuf::from(local).join("AICRM-Windows-API");
-
-    let console = dir.join("aicrm-console.exe");
-    if console.is_file() {
-        let _ = Command::new(console).spawn();
-        return;
-    }
-
-    let login = dir.join("aicrm-login.exe");
-    if !login.is_file() {
-        return;
-    }
-    let _ = Command::new(&login)
-        .arg("--endpoint")
-        .arg(format!("{}/api/auth/login", base_url.trim_end_matches('/')))
-        .arg("--token-file")
-        .arg(dir.join("api.token"))
-        .arg("--device-file")
-        .arg(dir.join("device.id"))
-        .spawn();
-}
-
 /// 调用载荷里的 install.ps1 完成落盘、注册自启与启动服务。
 ///
 /// 复用安装脚本而不是在 Rust 里重写一遍：拷贝文件、icacls 收紧权限、写 HKCU Run
 /// 这些逻辑已经在那边验证过了，重复实现只会多一处会走样的地方。
-/// 调随包的 `install.ps1` 落盘。
 ///
-/// `provision` 为 `None` 表示**静默安装**：拿不到账号密码就申领不了配对码，
-/// 设备身份留给客户端首次「连接云端」时去签发（install.ps1 会先落一个占位 id）。
-fn run_installer(
-    base_url: &str,
-    provision: Option<&cloud::Provision>,
-    work: &Path,
-) -> Result<String, String> {
+/// 安装是**静默**的：不问账号密码，设备身份留给客户端首次「连接云端」时
+/// 由主控台申领并签发（install.ps1 会先落一个占位 id）。
+fn run_installer(base_url: &str, work: &Path) -> Result<String, String> {
     let script = work.join("install.ps1");
     if !script.is_file() {
         return Err("安装载荷里缺少 install.ps1".to_owned());
@@ -278,19 +247,10 @@ fn run_installer(
         .arg(&script)
         .arg("-CloudUrl")
         .arg(base)
-        .arg("-Endpoint")
-        .arg(format!("{base}/api/auth/login"))
         // 网页来源白名单：云端网页和接口是同一个基地址，所以直接用它。
         // 不带这一项的话，装完网页端拿不到本机令牌，「数据采集」按钮点不动。
         .arg("-AllowOrigin")
         .arg(base);
-    if let Some(provision) = provision {
-        command
-            .arg("-DeviceId")
-            .arg(&provision.device_id)
-            .arg("-ProvisionCode")
-            .arg(&provision.provision_code);
-    }
 
     let output = command
         .output()
@@ -380,11 +340,6 @@ impl SetupApp {
         matches!(self.state, State::Working(_))
     }
 
-    /// 已经装完了：输入区保持灰态，但按钮区换成收尾动作（打开客户端 / 完成）。
-    fn finished(&self) -> bool {
-        matches!(self.state, State::Done(_))
-    }
-
     /// 登录地址与 API 基地址的关系：用户填的是登录接口，其余接口都在同一个源下。
     fn base_url(&self) -> String {
         let trimmed = self.endpoint.trim().trim_end_matches('/');
@@ -425,7 +380,7 @@ impl SetupApp {
                         .map(Path::to_path_buf)
                         .ok_or_else(|| "安装包路径异常".to_owned())?,
                 };
-                let log = run_installer(&base, None, &work)?;
+                let log = run_installer(&base, &work)?;
                 let _ = std::fs::remove_dir_all(&work);
                 Ok(format!(
                     "{log}\n\n下一步：客户端打开后会请你连一次云端，\

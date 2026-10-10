@@ -992,15 +992,9 @@ struct UpdateRequest {
     #[serde(default)]
     kind: String,
     version: String,
-    /// 发布时的文件名，例如 agent-0.1.2.exe。
-    #[serde(default)]
-    name: String,
     /// 期望的 SHA-256（小写十六进制）。
     #[serde(default)]
     sha256: String,
-    /// 字节数，只用于日志与界面提示。
-    #[serde(default)]
-    size: i64,
     /// 整包清单：一次更新要把安装目录里的多个程序一起换掉。
     ///
     /// 只带 `sha256`/`name` 一个文件的旧载荷仍然认（老云端 / 老清单），
@@ -1016,15 +1010,10 @@ struct UpdateRequest {
 struct UpdatePart {
     #[serde(default)]
     kind: String,
-    /// 发布产物名，只用于日志。
-    #[serde(default)]
-    name: String,
     #[serde(default)]
     target: String,
     #[serde(default)]
     sha256: String,
-    #[serde(default)]
-    size: i64,
 }
 
 /// 自更新允许替换的安装目录文件。与更新器 `ALLOWED_TARGETS` 对齐，

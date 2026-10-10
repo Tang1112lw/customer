@@ -5,10 +5,6 @@
     [string]$KeyDir = (Join-Path $InstallDir 'accounts'),
     [string]$Bind = '127.0.0.1:8765',
 
-    # ---- 登录窗口 ----
-    # 云端登录接口完整地址；给了就生成「登录.cmd」启动器。
-    [string]$Endpoint = '',
-
     # ---- 命令通道（云端控制本机取密钥/导出）----
     # 云端基地址，例如 https://xxx.trycloudflare.com；给了才启用轮询。
     [string]$CloudUrl = '',
@@ -57,10 +53,8 @@ function Resolve-Binary([string]$name) {
 }
 
 $exeSource     = Resolve-Binary 'aicrm_windows_api.exe'
-$loginSource   = Resolve-Binary 'aicrm-login.exe'
 $consoleSource = Resolve-Binary 'aicrm-console.exe'
 $exe           = Join-Path $InstallDir 'aicrm_windows_api.exe'
-$loginExe      = Join-Path $InstallDir 'aicrm-login.exe'
 $consoleExe    = Join-Path $InstallDir 'aicrm-console.exe'
 $tools       = Join-Path $InstallDir 'tools'
 $data        = Join-Path $InstallDir 'data'
@@ -104,8 +98,15 @@ foreach ($name in $stopNames) {
 }
 Start-Sleep -Seconds 1    # 给系统一点时间把文件句柄放掉
 
+# 已下线的旧程序：登录窗已并入主控台、托盘更早已并入。顺手清掉，别在安装目录留尸体。
+foreach ($obsolete in @('aicrm-login.exe', 'aicrm-tray.exe')) {
+    $obsoletePath = Join-Path $InstallDir $obsolete
+    if (Test-Path -LiteralPath $obsoletePath) {
+        Remove-Item -LiteralPath $obsoletePath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Copy-Item -LiteralPath $exeSource -Destination $exe -Force
-Copy-Item -LiteralPath $loginSource -Destination $loginExe -Force
 Copy-Item -LiteralPath $consoleSource -Destination $consoleExe -Force
 # 把自己也留一份。客户端首次「连接云端」时会再调一次本脚本完成配对
 # （令牌生成、自启项重写、重启服务都在这里，没必要在 Rust 里重写一遍）。
@@ -194,13 +195,6 @@ foreach ($sensitive in @($tokenFile, $deviceTokenFile, $deviceFile)) {
 # 真正敏感的是上面那三个凭据文件（尤其是能冒充设备的 device.token），已单独收紧。
 if (-not (Test-Path -LiteralPath $data)) { New-Item -ItemType Directory -Path $data -Force | Out-Null }
 
-# ---- 登录窗口启动器 ----
-if ($Endpoint) {
-    $launcher = Join-Path $InstallDir '登录.cmd'
-    $line = '@"{0}" --endpoint "{1}" --token-file "{2}" --device-file "{3}"' -f $loginExe, $Endpoint, $tokenFile, $deviceFile
-    [IO.File]::WriteAllText($launcher, "@echo off`r`n$line`r`n", [Text.Encoding]::Default)
-}
-
 # ---- 桌面与开始菜单快捷方式 ----
 # 客户从桌面图标启动界面；托盘里常驻，不需要每次手动开。
 $shortcutTargets = @(
@@ -265,9 +259,6 @@ Write-Output "密钥目录：$KeyDir"
 Write-Output "本地 API token：$tokenFile"
 Write-Output "主窗口：$consoleExe"
 Write-Output "快捷方式：AICRM.lnk（桌面 + 开始菜单）"
-Write-Output "登录窗口：$loginExe"
-if ($Endpoint) { Write-Output "登录启动器：$(Join-Path $InstallDir '登录.cmd')" }
-else { Write-Output '提示：加 -Endpoint <云端登录地址> 可生成登录启动器' }
 if ($CloudUrl) {
     Write-Output "命令通道：已接入 $($CloudUrl.TrimEnd('/'))"
     Write-Output "  设备 ID：$cloudDeviceId"
