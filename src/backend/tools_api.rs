@@ -54,32 +54,6 @@ pub fn router() -> Router<Arc<Service>> {
                 },
             ),
         )
-        .route(
-            "/api/aicrm/export/stream",
-            post(
-                |State(s): State<Arc<Service>>, Json(r): Json<ExportRequest>| async move {
-                    s.export_stream(r).await
-                },
-            ),
-        )
-        .route(
-            "/api/aicrm/export/bundle",
-            post(
-                |State(s): State<Arc<Service>>, Json(r): Json<ExportRequest>| async move {
-                    let _job = super::service::agent_service::JobGuard::new();
-                    s.export_bundle(r, false).await
-                },
-            ),
-        )
-        .route(
-            "/api/aicrm/export/ai-bundle",
-            post(
-                |State(s): State<Arc<Service>>, Json(r): Json<ExportRequest>| async move {
-                    let _job = super::service::agent_service::JobGuard::new();
-                    s.export_bundle(r, true).await
-                },
-            ),
-        )
         // 数据采集：导出聊天记录并上传到云端任务。浏览器里的前端点「数据采集」就走这里。
         //
         // **必须立刻返回，不能 await 到底**：导出要跑几分钟，挂在请求里的话浏览器

@@ -239,7 +239,7 @@ mod tests {
 
     /// 全部已注册接口。新增接口时同步补进这张表，用来确认它同样被顶层鉴权覆盖。
     /// 不含 `GET /api/aicrm/session`：那是刻意挂在鉴权层之外的握手端点，见 [`super::session`]。
-    const ROUTES: [(&str, &str); 11] = [
+    const ROUTES: [(&str, &str); 8] = [
         ("GET", "/api/aicrm/key/version"),
         ("GET", "/api/aicrm/export/version"),
         ("GET", "/api/aicrm/key/help"),
@@ -247,9 +247,6 @@ mod tests {
         ("GET", "/api/aicrm/accounts"),
         ("POST", "/api/aicrm/prepare"),
         ("POST", "/api/aicrm/export"),
-        ("POST", "/api/aicrm/export/stream"),
-        ("POST", "/api/aicrm/export/bundle"),
-        ("POST", "/api/aicrm/export/ai-bundle"),
         ("POST", "/api/aicrm/collect"),
     ];
 
