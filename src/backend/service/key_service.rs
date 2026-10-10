@@ -36,33 +36,49 @@ pub struct PrepareRequest {
     pub no_restart: bool,
 }
 
+/// 把"工具自己找不到微信"这类原话翻译成客户能照做的话。
+///
+/// 工具的原话是「请用 --weixin-exe 指定 Weixin.exe 完整路径」—— 客户没有路径可填，
+/// 这句话对他没有任何意义。客户端已经替它找过一遍（注册表 + 常见安装目录），
+/// 所以这里只需要说清"这台机器上没找到微信"以及下一步做什么。
+fn translate_key_error(error: ApiError, weixin_exe: Option<&str>) -> ApiError {
+    let message = error.message().to_owned();
+    let locating_failed = message.contains("无法定位微信")
+        || message.contains("Weixin.exe")
+        || message.contains("weixin-exe");
+    if !locating_failed {
+        return error;
+    }
+    let hint = match weixin_exe {
+        Some(path) => format!("客户端已定位到 {path}，但它不是可用的微信程序"),
+        None => "客户端已查过注册表与常见安装目录，都没找到微信程序".to_owned(),
+    };
+    ApiError::helper(format!(
+        "这台电脑上没找到微信程序：请确认微信已安装并已登录，然后重新绑定。（{hint}；原始信息：{message}）"
+    ))
+}
+
 impl Service {
     pub async fn key_version(&self) -> ApiResult<Value> {
         self.version(KEY_PROGRAM).await
     }
 
     pub async fn prepare(&self, request: PrepareRequest) -> ApiResult<Value> {
-        // 本机已经有**对得上**的密钥与解密缓存时，直接成功返回，不再去抓一遍。
+        // **云端让绑定，就真抓一遍。**
         //
-        // 抓密钥会重启微信、还要客户配合重新登录 —— 客户正用着电脑的时候，这是最
-        // 容易被投诉的动作；而且一旦抓取失败，整条绑定就卡在"正在检测本机微信…"
-        // 再也不回来（实测卡死过）。密钥本来就在、且就是要绑的那个号，复用就是了。
+        // 这里原先还留了一条"定向重绑（expected 匹配本机缓存）就复用"的捷径，2026-10-10
+        // 按产品要求删掉：网页上点「绑定微信账号」的语义就是"去这台电脑上抓一次密钥"，
+        // 复用会把"点了没反应"变成常态（客户以为在抓、其实一行都没跑），换号之后更是
+        // 会把旧号的密钥当新号报上去。
         //
-        // 但「复用」必须克制，只在两种情况下发生：
-        //   1. 核对模式（no_restart）—— 只看不抓，返回本机已有结论；
-        //   2. 定向重新绑定（expected 明确且与本机缓存一致）—— 明确就是这个号。
-        // 其余一律真抓。**换过微信账号之后再点绑定**（expected 为空）必须真抓当前
-        // 微信，否则会把旧账号的密钥「复用成功」—— 实测踩过：客户换号后点绑定
-        // 秒回旧微信号，新号的密钥根本没抓，云端还把新账号记到了旧微信号上。
-        if !request.force
+        // 唯一保留复用的地方是**核对模式**（`no_restart`）：那是服务自己的定期自检，
+        // 只回答"本机密钥还在不在、够不够用"，绝不能每 10 分钟重启一次客户的微信。
+        // 核对模式只由本机调用，云端命令不会带它。
+        if request.no_restart
+            && !request.force
             && let Some((wxid, credential, cache)) = self.key_state()
             && credential
             && cache
-            && (request.no_restart
-                || request
-                    .expected_wxid
-                    .as_deref()
-                    .is_some_and(|expected| !expected.is_empty() && expected == wxid))
         {
             let (wxid, name) = self.local_account_label(&wxid);
             self.remember_bound_account(&wxid, &name)?;
@@ -86,7 +102,16 @@ impl Service {
         ];
         option(&mut args, "--expected-wxid", request.expected_wxid)?;
         option(&mut args, "--wechat-dir", request.wechat_dir)?;
-        option(&mut args, "--weixin-exe", request.weixin_exe)?;
+        // 微信程序路径：云端没给就自己找 —— 客户机把微信装在 D 盘、或装在工具认不出的
+        // 目录都很常见，找不到时工具只会甩一句"请用 --weixin-exe 指定"，客户照做不了。
+        let weixin_exe = request
+            .weixin_exe
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or_else(|| crate::backend::wechat::find_weixin_exe().map(|path| path.display().to_string()));
+        option(&mut args, "--weixin-exe", weixin_exe.clone())?;
         if let Some(n) = request.capture_timeout {
             if !(10..=300).contains(&n) {
                 return Err(ApiError::bad("capture_timeout 须为 10-300"));
@@ -99,9 +124,10 @@ impl Service {
         if request.no_restart {
             args.push("--no-restart".into());
         }
-        let mut result = self
-            .run(KEY_PROGRAM, args, Duration::from_secs(600))
-            .await?;
+        let mut result = match self.run(KEY_PROGRAM, args, Duration::from_secs(600)).await {
+            Ok(value) => value,
+            Err(error) => return Err(translate_key_error(error, weixin_exe.as_deref())),
+        };
         if let Some(object) = result.as_object_mut() {
             object.remove("key_word");
         }

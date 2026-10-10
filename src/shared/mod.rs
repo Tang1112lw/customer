@@ -28,3 +28,4 @@ pub mod preflight;
 pub mod process;
 pub mod self_name;
 pub mod session;
+pub mod wechat;

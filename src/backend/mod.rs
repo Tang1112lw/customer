@@ -6,6 +6,8 @@ pub(crate) mod cache;
 pub(crate) mod self_name;
 #[path = "../shared/session.rs"]
 pub(crate) mod session;
+#[path = "../shared/wechat.rs"]
+pub(crate) mod wechat;
 pub mod service;
 pub mod tools_api;
 
