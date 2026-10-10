@@ -98,8 +98,9 @@ foreach ($name in $stopNames) {
 }
 Start-Sleep -Seconds 1    # 给系统一点时间把文件句柄放掉
 
-# 已下线的旧程序：登录窗已并入主控台、托盘更早已并入。顺手清掉，别在安装目录留尸体。
-foreach ($obsolete in @('aicrm-login.exe', 'aicrm-tray.exe')) {
+# 已下线的旧程序：登录窗已并入主控台、托盘更早已并入、登录启动器指向的程序已不存在。
+# 顺手清掉，别在安装目录留尸体。
+foreach ($obsolete in @('aicrm-login.exe', 'aicrm-tray.exe', '登录.cmd')) {
     $obsoletePath = Join-Path $InstallDir $obsolete
     if (Test-Path -LiteralPath $obsoletePath) {
         Remove-Item -LiteralPath $obsoletePath -Force -ErrorAction SilentlyContinue
