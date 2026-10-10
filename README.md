@@ -187,6 +187,26 @@ Start-Process pwsh -ArgumentList '-NoProfile','-File','.\mock-agent-cloud.ps1','
 
 它只下发一次 `wechat.export`（`-MaxCommands` 可调），收到结果后退出。它不实现心跳端点 `/api/agent/v1/status`，也不支持 `wechat.bind` / `wechat.collect`，因此服务日志里会出现心跳 404 —— 只影响日志，不影响那条导出命令的往返。
 
+## 绑定微信：网页点按钮 → 客户端**真抓**
+
+网页上点「绑定微信账号」的语义是：**让那台电脑重新抓一次密钥**。这里有三层"复用"，
+改动时必须一起看：
+
+| 层 | 谁会"复用" | 现在的做法 |
+| --- | --- | --- |
+| ① 客户端包装层 `Service::prepare` | 我们自己 | **不复用**：只保留服务每 10 分钟自检用的 `no_restart`（那条绝不能重启客户微信） |
+| ② 抓密钥程序 `AICRM-Key.exe` | 第三方自带的行为：手册原文「验证通过会直接显示"复用，未重新抓取"，不会重启微信」 | 用 `--force` 压过它（手册原文：「忽略已有密钥并重新捕获」） |
+| ③ 云端绑定指令 | 控制面 `CreateBinding` | 一律带 `force: true` |
+
+于是行为是确定的：点一次绑定 = 一定跑一次真抓（微信会重启、需要重新登录，网页弹窗
+已经这么提示）；本机已有密钥也照抓；抓不到就报真实原因，**不会拿旧密钥冒充成功**。
+
+**微信程序路径由客户端自己找**（`src/shared/wechat.rs`）：注册表安装登记
+（`...\Uninstall\Weixin` 的 `DisplayIcon` / `InstallLocation`，装在 D 盘也能查到）→
+常见安装目录（`%ProgramFiles%\Tencent\Weixin`、`...\WeChat` 等）。找到就把完整路径
+作为 `--weixin-exe` 传给抓密钥程序；找不到时给的是"请确认微信已安装并已登录"这种
+能照做的提示，而不是把工具那句「请用 --weixin-exe 指定」甩给客户。
+
 ## 接口
 
 除下面单列的握手端点外，所有接口都要求 `Authorization: Bearer <token>`，token 在 `%LOCALAPPDATA%\AICRM-Windows-API\api.token`。接口层只解析请求、调用 `backend/service/` 的函数。该目录按辅助程序拆分：`service/mod.rs` 是共享底座（服务状态、进程调用、并发闸门、`authorize` 鉴权中间件），`service/key_service.rs` 承载 `AICRM-Key.exe` 业务（密钥准备、账号查询），`service/export_service.rs` 承载 `aicrm-export-new.exe` 业务（Markdown 导出执行），`service/archive_service.rs` 承载 Markdown 归档打包与上传（数据采集闭环上半段），`service/agent_service.rs` 是云端命令通道（长轮询 + 心跳）。跨二进制共享的无界面工具在 `src/shared/`（路径约定 / 设备凭据 / 进程管理 / 缓存探测 / 机主昵称）。
@@ -348,7 +368,7 @@ Invoke-RestMethod "$base/api/aicrm/export" -Method Post -Headers $headers `
 客户端每 20 秒心跳一次上报 `agentVersion`；云端发现落后于已发布版本时下发 `agent.update`。
 更新包与指令都**不经过网页** —— 网页只是仪表盘（显示版本落后、提供手动推送按钮）。
 
-- 下载：凭 Device 令牌取 `GET <云端>/api/agent/v1/programs/agent`（整包时逐件再取 `console`；0.1.47 起不再有 `login` 件，0.1.43 前的旧客户端只认单件），本地 SHA-256 校验。下载超时 600 秒 —— 整包里的界面程序近 10 MB，曾用 45 秒长轮询超时，下载必被误杀
+- 下载：凭**登录令牌**（`Authorization: Bearer <api.token>`）取 `GET <云端>/api/agent/v1/programs/agent`（整包时逐件再取 `console`；0.1.47 起不再有 `login` 件，0.1.43 前的旧客户端只认单件），本地 SHA-256 校验。下载超时 600 秒 —— 整包里的界面程序近 10 MB，曾用 45 秒长轮询超时，下载必被误杀
 - 落盘：`updates/<版本>/` + `updates/pending.json`（**只允许升级写入**：云端换版本快于下载时，后到的旧命令不得覆盖新标记）
 - 应用时机（0.1.33 起）：下载校验就绪后**等空闲自动重启应用** —— 重活计数（采集 / 导出 / 绑定）归零、再留 15 秒把命令回执发出去，然后拉起更新器；一直忙则退回「下次启动」兜底路径
 - 替换：拉起 **`aicrm-update.exe`**（原生 exe，不经解释器）完成：
@@ -366,6 +386,20 @@ Invoke-RestMethod "$base/api/aicrm/export" -Method Post -Headers $headers `
    而不是悄悄写到别处。
 3. **子进程必须重定向 stdio**。子进程若继承父进程管道，父进程退出后写 stdout 会失败，
    而 Rust 的 `println!` 写失败会直接 panic 终止进程 —— 表现为「更新成功、进程却没了」。
+
+### 发布新版本（服务端）
+
+```bash
+cd windows/control-plane
+go run ./cmd/publish-program -kind agent   -version 0.1.48 -file agent-0.1.48.exe
+go run ./cmd/publish-program -kind console -version 0.1.48 -file console-0.1.48.exe
+sudo systemctl restart aicrm-control-plane   # programs.json 在启动时读入
+```
+
+**老客户端升不动的坑**：0.1.47 及更早的客户端讲的是设备令牌协议，与新云端不兼容
+（心跳 / 取命令都会 401）—— 它们**收不到更新命令**，必须用新安装包覆盖一次；
+覆盖之后即可自动更新。2026-10-10 实测：本机 0.1.47 → 0.1.48 全自动完成
+（服务端日志 `已下发客户端更新 from 0.1.47 to 0.1.48`）。
 
 ## 更新逻辑的权威规格
 
