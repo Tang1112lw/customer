@@ -251,8 +251,8 @@ mod com {
 
     /// 取 vtable 第 index 项并转成函数指针。
     unsafe fn slot<F>(object: *mut c_void, index: usize) -> F {
-        let table = *(object as *mut *mut usize);
-        let entry = *table.add(index);
+        let table = unsafe { *(object as *mut *mut usize) };
+        let entry = unsafe { *table.add(index) };
         unsafe { std::mem::transmute_copy::<usize, F>(&entry) }
     }
 

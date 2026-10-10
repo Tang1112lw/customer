@@ -95,7 +95,7 @@ if (Test-Path -LiteralPath $manifest) {
 New-Item -ItemType Directory -Force -Path $InstallDir, $tools, $data | Out-Null
 # 覆盖前必须停掉还在跑的旧进程：界面和托盘开着的时候，Copy-Item 会直接撞上
 # "文件正由另一进程使用" 而中断安装。安装器自身不在列表里 —— 停自己会让脚本当场断掉。
-$stopNames = @('aicrm_windows_api.exe', 'aicrm-console.exe', 'aicrm-login.exe', 'aicrm-tray.exe')
+$stopNames = @('aicrm_windows_api.exe', 'aicrm-console.exe', 'aicrm-login.exe')
 if ($KeepConsole) { $stopNames = $stopNames | Where-Object { $_ -ne 'aicrm-console.exe' } }
 foreach ($name in $stopNames) {
     Get-CimInstance Win32_Process -Filter "Name = '$name'" |

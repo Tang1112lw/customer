@@ -268,7 +268,7 @@ fn stop_service() {
 /// 不显式收掉就会留在后台占着 8765：用户以为退出了、其实还在跑，重启或重装
 /// 都得先去任务管理器手动杀进程。调用者自己不在这个列表里，由调用处 process::exit 退出。
 fn stop_other_client_processes() {
-    for name in ["aicrm_windows_api.exe", "aicrm-login.exe", "aicrm-tray.exe"] {
+    for name in ["aicrm_windows_api.exe", "aicrm-login.exe"] {
         let _ = Command::new("taskkill")
             .args(["/IM", name, "/F"])
             .creation_flags(CREATE_NO_WINDOW)

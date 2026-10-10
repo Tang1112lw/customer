@@ -22,15 +22,6 @@ mod sha256;
 #[path = "shortcut.rs"]
 mod shortcut;
 
-/// 替换前要停掉的客户端程序。按镜像名杀 —— 客户机上只有安装目录一份，
-/// 比按路径过滤简单，也避免依赖 CIM/WMI（部分机器上被安全软件禁用）。
-const CLIENT_PROGRAMS: [&str; 4] = [
-    "aicrm_windows_api.exe",
-    "aicrm-console.exe",
-    "aicrm-login.exe",
-    "aicrm-tray.exe",
-];
-
 /// 允许被替换的文件白名单。收到名单外的文件名一律报错 ——
 /// 宁可这次更新失败，也不能把文件悄悄写到别的位置（实测踩过：把发布产物名
 /// 当成目标名，结果安装目录多出一个 agent-0.1.4.exe，主程序根本没换）。
@@ -225,9 +216,8 @@ fn apply(options: &Options) -> Result<(), String> {
 ///      系统索引都会拖住）。这里循环"杀→查→再杀"，直到确认干净（最多 15 秒）。
 fn stop_clients() {
     // 顺序：看守者在前，被看守的服务在最后。
-    const ORDER: [&str; 4] = [
+    const ORDER: [&str; 3] = [
         "aicrm-console.exe",
-        "aicrm-tray.exe",
         "aicrm-login.exe",
         "aicrm_windows_api.exe",
     ];

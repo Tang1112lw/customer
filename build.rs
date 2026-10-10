@@ -1,11 +1,11 @@
-//! 构建脚本：把 `assets/aicrm.ico` 作为 Windows 资源嵌进 `aicrm-tray.exe`，
+//! 构建脚本：把 `assets/aicrm.ico` 作为 Windows 资源嵌进分发给客户的每个程序，
 //! 这样资源管理器/任务栏里显示的就是正式图标，而不是空白通用图标。
 //!
 //! 为什么手写 `.res` 而不引 `winres` / `embed-resource`：这个包一直刻意压依赖
 //! （连 HTTP 都挑了 ureq），而 `.res` 的格式只有一页纸，为它多一个编译期依赖不划算。
 //!
-//! 只作用于 `aicrm-tray`：用 `rustc-link-arg-bin` 而非全局 `rustc-link-arg`，
-//! 其余三个二进制（含后台服务）不受影响。
+//! 用 `rustc-link-arg-bin` 而非全局 `rustc-link-arg` 逐目标施加，
+//! 测试等其它产物不受影响。
 
 use std::{env, fs, path::PathBuf};
 
@@ -37,7 +37,7 @@ fn main() {
         Err(error) => {
             // 只警告不失败：没有图标不该让整个构建挂掉。
             println!(
-                "cargo:warning=读不到 {}（{error}），aicrm-tray 将没有文件图标",
+                "cargo:warning=读不到 {}（{error}），分发的程序将没有文件图标",
                 ico.display()
             );
             return;
