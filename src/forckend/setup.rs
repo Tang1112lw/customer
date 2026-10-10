@@ -28,15 +28,18 @@ mod single;
 #[allow(dead_code)]
 mod theme;
 
+#[path = "../shared/mod.rs"]
+mod shared;
+
+#[path = "../shared/font.rs"]
+mod font;
+
 use eframe::egui;
 use std::{
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::Command,
-    sync::{
-        Arc,
-        mpsc::{self, Receiver, TryRecvError},
-    },
+    sync::mpsc::{self, Receiver, TryRecvError},
 };
 
 /// 默认云端地址。打包时按实际部署改这里，用户就不用填了。
@@ -86,37 +89,11 @@ fn main() -> eframe::Result {
         "AICRM 安装",
         options,
         Box::new(move |cc| {
-            install_cjk_font(&cc.egui_ctx);
+            font::install_cjk_font(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx);
             Ok(Box::new(SetupApp::new(endpoint)))
         }),
     )
-}
-
-/// egui 自带字体不含 CJK，不加载中文字体整个界面会是方框。
-fn install_cjk_font(ctx: &egui::Context) {
-    const CANDIDATES: [&str; 4] = [
-        r"C:\Windows\Fonts\msyh.ttc",
-        r"C:\Windows\Fonts\simhei.ttf",
-        r"C:\Windows\Fonts\Deng.ttf",
-        r"C:\Windows\Fonts\simsun.ttc",
-    ];
-    let Some(bytes) = CANDIDATES.iter().find_map(|path| std::fs::read(path).ok()) else {
-        return;
-    };
-    let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "cjk".to_owned(),
-        Arc::new(egui::FontData::from_owned(bytes)),
-    );
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .push("cjk".to_owned());
-    }
-    ctx.set_fonts(fonts);
 }
 
 /// 内嵌载荷的页脚：`[offset u64][len u64]["AICRMSFX"]`，贴在 exe 末尾 24 字节。
@@ -295,11 +272,7 @@ fn open_console() -> Result<String, String> {
         return Ok("客户端已在运行，已切到前台".to_owned());
     }
 
-    let exe = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("AICRM-Windows-API")
-        .join("aicrm-console.exe");
+    let exe = shared::paths::install_dir().join("aicrm-console.exe");
     if !exe.is_file() {
         return Err(format!("找不到客户端程序：{}", exe.display()));
     }

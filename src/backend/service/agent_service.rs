@@ -62,6 +62,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::backend::self_name::self_name_from_exports;
+
 use super::{ApiError, ApiResult, ArchiveRequest, ExportRequest, PrepareRequest, Service, now_rfc3339};
 
 /// 长轮询的挂起秒数。云端允许 5..=60；取中间值，兼顾实时性与连接数。
@@ -294,53 +296,6 @@ pub(crate) fn wechat_process_running() -> bool {
     })
 }
 
-/// 从本地导出的 messages.json 里找机主自己的微信号（昵称）。
-///
-/// 导出目录形状是 `<root>/<wxid>/<会话>/<日期>/messages.json`，每条消息的
-/// `sender.is_self == true` 表示是机主发的，其 `sender.display_name` 就是微信号。
-/// 深度优先翻到第一份能给出昵称的导出为止；只翻 20 份文件 —— 心跳每 20 秒跑
-/// 一次，这个开销必须兜得住。找不到就返回空串，界面回落显示 wxid。
-fn self_name_from_exports(root: &Path) -> String {
-    let mut stack = vec![root.to_path_buf()];
-    let mut opened = 0usize;
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if entry.file_name() == "messages.json" {
-                opened += 1;
-                if opened > 20 {
-                    return String::new();
-                }
-                if let Some(name) = self_name_in_export(&path) {
-                    return name;
-                }
-            }
-        }
-    }
-    String::new()
-}
-
-/// 读一份 messages.json，返回机主的 display_name。
-fn self_name_in_export(path: &Path) -> Option<String> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let value = serde_json::from_str::<Value>(&raw).ok()?;
-    for message in value.get("messages")?.as_array()? {
-        let sender = message.get("sender")?;
-        if sender.get("is_self") == Some(&Value::Bool(true)) {
-            let name = sender.get("display_name").and_then(Value::as_str);
-            if let Some(name) = name.filter(|name| !name.is_empty()) {
-                return Some(name.to_owned());
-            }
-        }
-    }
-    None
-}
-
 /// 探测本机微信的可采集状态。
 ///
 /// 云端要求：只有 `online=true` 的设备才允许被下发采集任务，而 `online=true` 必须同时
@@ -385,7 +340,7 @@ impl WeChatProbe {
             // 昵称翻导出目录才能拿到，而心跳每 20 秒一次 —— 先查缓存，
             // 缓存没有才翻盘，翻到就记住，之后这台机器再也不用扫目录。
             probe.name = service.state.known_name(&probe.wxid).unwrap_or_else(|| {
-                let found = self_name_from_exports(&service.data.join("jobs"));
+                let found = self_name_from_exports(&service.data.join("jobs")).unwrap_or_default();
                 if !found.is_empty() {
                     service.state.remember_name(&probe.wxid, &found);
                 }
@@ -908,27 +863,6 @@ mod tests {
         assert_eq!(rfc3339(1_000_000_000), "2001-09-09T01:46:40Z");
         // 取自真实签发的 JWT iat：2026-10-06 18:49:01 +08:00
         assert_eq!(rfc3339(1_791_283_741), "2026-10-06T10:49:01Z");
-    }
-
-    #[test]
-    fn self_name_comes_from_own_messages() {
-        let dir = tempfile::tempdir().unwrap();
-        let day = dir.path().join("wxid_test").join("张三").join("2026-10-05");
-        std::fs::create_dir_all(&day).unwrap();
-        std::fs::write(
-            day.join("messages.json"),
-            r#"{"messages":[
-                {"sender":{"is_self":false,"display_name":"张三"}},
-                {"sender":{"is_self":true,"display_name":"flow state"}}]}"#,
-        )
-        .unwrap();
-        assert_eq!(self_name_from_exports(dir.path()), "flow state");
-    }
-
-    #[test]
-    fn missing_exports_yield_empty_name() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(self_name_from_exports(dir.path()), "");
     }
 
     fn command_with_lease() -> Command {

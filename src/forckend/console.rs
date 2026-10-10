@@ -31,9 +31,15 @@ mod theme;
 #[path = "../shared/mod.rs"]
 mod shared;
 
+#[path = "../shared/font.rs"]
+mod font;
+
 use shared::{
+    cache::decrypted_cache_ready,
     device,
     paths::{self, install_dir},
+    process,
+    self_name::self_name_from_exports,
 };
 
 use eframe::egui;
@@ -91,37 +97,11 @@ fn main() -> eframe::Result {
         "AICRM",
         options,
         Box::new(move |cc| {
-            install_cjk_font(&cc.egui_ctx);
+            font::install_cjk_font(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx);
             Ok(Box::new(Console::new(!hidden)))
         }),
     )
-}
-
-/// egui 自带字体不含 CJK，不加载中文字体整个界面是方框。
-fn install_cjk_font(ctx: &egui::Context) {
-    const CANDIDATES: [&str; 4] = [
-        r"C:\Windows\Fonts\msyh.ttc",
-        r"C:\Windows\Fonts\simhei.ttf",
-        r"C:\Windows\Fonts\Deng.ttf",
-        r"C:\Windows\Fonts\simsun.ttc",
-    ];
-    let Some(bytes) = CANDIDATES.iter().find_map(|path| std::fs::read(path).ok()) else {
-        return;
-    };
-    let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "cjk".to_owned(),
-        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
-    );
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .push("cjk".to_owned());
-    }
-    ctx.set_fonts(fonts);
 }
 
 /// 启动后台服务的命令。参数与 `install.ps1` 写进自启项的完全一致，
@@ -218,27 +198,6 @@ fn read_trimmed(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn stop_service() {
-    let _ = Command::new("taskkill")
-        .args(["/IM", "aicrm_windows_api.exe", "/F"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-}
-
-/// 结束除自己以外的全部客户端进程（本地服务、登录器、托盘）。
-///
-/// 托盘「退出」要的是"干净地关掉"，而不只是关掉界面 —— 本地服务是独立进程，
-/// 不显式收掉就会留在后台占着 8765：用户以为退出了、其实还在跑，重启或重装
-/// 都得先去任务管理器手动杀进程。调用者自己不在这个列表里，由调用处 process::exit 退出。
-fn stop_other_client_processes() {
-    for name in ["aicrm_windows_api.exe", "aicrm-login.exe"] {
-        let _ = Command::new("taskkill")
-            .args(["/IM", name, "/F"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-    }
-}
-
 /// 是否已经有另一个实例在跑（自己也在进程列表里，所以数到 2 才算重复）。
 ///
 /// 没有用互斥量：托盘每次点击都会拉起一次程序，开出一串窗口是必然的事故，
@@ -281,7 +240,7 @@ fn connect_task(base: &str, username: &str, password: &str) -> Result<String, St
     if paired() {
         // 已配对：换令牌就是全部工作。服务启动时读一次令牌，重启才换得掉。
         if service_up() {
-            stop_service();
+            process::stop_service();
         }
         let mut message = format!("已登录：{who}。服务将用新令牌重启");
         if let Some(notice) = warning {
@@ -468,28 +427,6 @@ struct Job {
     modified: Option<SystemTime>,
 }
 
-/// 解密缓存（聊天数据库）是否已经生成。
-///
-/// 位置是 `<安装目录>/accounts/cache/*.db` —— 见账号目录里的 config.json：
-/// `"decrypted_dir": "cache"`，相对密钥目录解析。（老布局在 wxid 子目录下，一并认。）
-///
-/// 服务端那份同源实现在 `backend::service::decrypted_cache_ready`；界面是独立程序
-/// （不挂 backend 模块），所以这里保留一份等价实现。改的时候两边都要改。
-fn decrypted_cache_ready(accounts: &std::path::Path, wxid: &str) -> bool {
-    [accounts.join("cache"), accounts.join(wxid).join("cache")]
-        .iter()
-        .any(|dir| {
-            std::fs::read_dir(dir).is_ok_and(|entries| {
-                entries.flatten().any(|entry| {
-                    entry
-                        .path()
-                        .extension()
-                        .is_some_and(|extension| extension.eq_ignore_ascii_case("db"))
-                })
-            })
-        })
-}
-
 fn snapshot() -> Snapshot {
     let dir = install_dir();
     let mut snap = Snapshot {
@@ -607,52 +544,6 @@ fn snapshot() -> Snapshot {
         snap.jobs = jobs;
     }
     snap
-}
-
-/// 从本地导出的 messages.json 里找机主自己的微信号（昵称）。
-///
-/// 与后台服务心跳里的 `wechat.name` 同源：`sender.is_self == true` 的那条消息，
-/// 其 `sender.display_name` 就是微信号（如 "flow state"）。只翻 20 份导出，
-/// 找不到回落显示 wxid。
-fn self_name_from_exports(root: &Path) -> Option<String> {
-    let mut stack = vec![root.to_path_buf()];
-    let mut opened = 0usize;
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if entry.file_name() == "messages.json" {
-                opened += 1;
-                if opened > 20 {
-                    return None;
-                }
-                if let Some(name) = self_name_in_export(&path) {
-                    return Some(name);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// 读一份 messages.json，返回机主的 display_name；没有就给 None，继续翻下一份。
-fn self_name_in_export(path: &Path) -> Option<String> {
-    let value: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-    for message in value.get("messages")?.as_array()? {
-        let sender = message.get("sender")?;
-        if sender.get("is_self") == Some(&serde_json::Value::Bool(true)) {
-            let name = sender.get("display_name").and_then(|name| name.as_str());
-            if let Some(name) = name.filter(|name| !name.is_empty()) {
-                return Some(name.to_owned());
-            }
-        }
-    }
-    None
 }
 
 fn dir_size(path: &Path) -> u64 {
@@ -817,7 +708,7 @@ impl Console {
             Ok(()) => {
                 // 服务把令牌读在内存里，重启才换得掉
                 if self.snap.service_up {
-                    stop_service();
+                    process::stop_service();
                 }
                 self.note = Some("已退出登录；启动服务后使用新令牌".to_owned());
             }
@@ -890,7 +781,7 @@ impl eframe::App for Console {
                     self.refresh();
                 }
                 Some(shell::Action::StopService) => {
-                    stop_service();
+                    process::stop_service();
                     self.note = Some("已发送停止指令".to_owned());
                     self.refresh();
                 }
@@ -898,7 +789,7 @@ impl eframe::App for Console {
                 Some(shell::Action::Quit) => {
                     // 托盘「退出」= 完全退出：先收掉本地服务等子进程，再退自己。
                     // 只关界面会把 aicrm_windows_api.exe 留在后台占着 8765。
-                    stop_other_client_processes();
+                    process::stop_all_except("aicrm-console.exe");
                     std::process::exit(0);
                 }
                 None => {}
@@ -1121,7 +1012,7 @@ impl Console {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.snap.service_up {
                         if theme::danger_button(ui, "停止服务").clicked() {
-                            stop_service();
+                            process::stop_service();
                             // 手停就是手停，别再自动把它拉回来。
                             self.auto_service = false;
                             self.note = Some("已停止服务（不再自动拉起）".to_owned());

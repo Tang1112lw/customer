@@ -16,7 +16,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-#[path = "../backend/sha256.rs"]
+#[path = "../shared/mod.rs"]
+mod shared;
+
+#[path = "../shared/sha256.rs"]
 mod sha256;
 
 #[path = "shortcut.rs"]
@@ -65,10 +68,7 @@ struct Options {
 
 impl Options {
     fn parse() -> Self {
-        let mut install_dir = std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("AICRM-Windows-API");
+        let mut install_dir = shared::paths::install_dir();
         let mut grace = 8u64;
         let mut ensure_shortcut = false;
         let mut arguments = std::env::args().skip(1);
@@ -193,9 +193,9 @@ fn apply(options: &Options) -> Result<(), String> {
     log(&options.log_file(), "替换完成，重启客户端");
     start_clients(options)?;
     confirm_restart(options, &replaced, &backup)?;
-    // 已下线的旧程序顺手清掉：aicrm-login（登录已并入主控台）、aicrm-tray（更早已并入）。
+    // 已下线的旧程序顺手清掉（名单见 shared/process.rs 的 OBSOLETE_PROGRAMS）。
     // 失败只记日志 —— 文件占用之类不该让整次更新作废，下次更新还会再试。
-    for name in ["aicrm-login.exe", "aicrm-tray.exe"] {
+    for name in shared::process::OBSOLETE_PROGRAMS {
         let path = options.install_dir.join(name);
         if path.is_file() {
             match std::fs::remove_file(&path) {
@@ -218,30 +218,17 @@ fn apply(options: &Options) -> Result<(), String> {
 
 /// 停掉正在运行的客户端，并**确认它们真的退出了**才返回。
 ///
-/// 两个坑都踩过：
-///   ① 先杀服务、后杀界面 —— 界面（aicrm-console）看守着本地服务，服务刚被杀
-///      它立刻又把服务拉起来，接着覆盖 exe 就撞上「另一个程序正在使用此文件」，
-///      整次更新白跑。所以**先杀看守者（界面/托盘），最后杀服务**。
-///   ② 只杀一次、只睡 1 秒也不够：进程退出与文件句柄释放之间有延迟（杀软扫描、
-///      系统索引都会拖住）。这里循环"杀→查→再杀"，直到确认干净（最多 15 秒）。
+/// 顺序的坑（先杀服务会被主控台原地拉起来）见 `shared/process.rs` 的名单注释。
+/// 这里补第二个坑：只杀一次、只睡 1 秒不够 —— 进程退出与文件句柄释放之间有延迟
+/// （杀软扫描、系统索引都会拖住）。所以循环"杀→查→再杀"，直到确认干净（最多 15 秒）。
 fn stop_clients() {
-    // 顺序：看守者在前，被看守的服务在最后。
-    // `aicrm-login` 已并入主控台、不再随包分发 —— 保留在名单里是为了覆盖
-    // 从旧版本升级的机器（更新那一刻旧登录窗可能还开着）。
-    const ORDER: [&str; 3] = [
-        "aicrm-console.exe",
-        "aicrm-login.exe",
-        "aicrm_windows_api.exe",
-    ];
     for _ in 0..15 {
         let mut alive = false;
-        for name in ORDER {
-            let _ = Command::new("taskkill")
-                .args(["/F", "/IM", name])
-                .output();
+        for name in shared::process::CLIENT_PROGRAMS {
+            shared::process::terminate(name);
         }
-        for name in ORDER {
-            if process_running(name) {
+        for name in shared::process::CLIENT_PROGRAMS {
+            if shared::process::running(name).unwrap_or(false) {
                 alive = true;
             }
         }
@@ -252,15 +239,6 @@ fn stop_clients() {
         }
         std::thread::sleep(Duration::from_secs(1));
     }
-}
-
-/// 进程是否还在跑。按镜像名查，和停止用的口径一致。
-fn process_running(name: &str) -> bool {
-    Command::new("tasklist")
-        .args(["/FI", &format!("IMAGENAME eq {name}"), "/NH"])
-        .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).contains(name))
-        .unwrap_or(false)
 }
 
 /// 覆盖文件，遇到"文件正在使用"重试几次（每次都重新停一遍客户端）。
@@ -408,15 +386,7 @@ fn confirm_restart(options: &Options, replaced: &[String], backup: &Path) -> Res
 /// 用 tasklist 探活。查不到进程信息时返回 true —— 不能因为探活工具本身失败
 /// 就把一次正常的更新判成失败。
 fn service_alive() -> bool {
-    match Command::new("tasklist")
-        .args(["/FI", "IMAGENAME eq aicrm_windows_api.exe", "/NH"])
-        .output()
-    {
-        Ok(result) => String::from_utf8_lossy(&result.stdout)
-            .to_ascii_lowercase()
-            .contains("aicrm_windows_api.exe"),
-        Err(_) => true,
-    }
+    shared::process::running(shared::process::SERVICE_PROGRAM).unwrap_or(true)
 }
 
 fn rollback(install_dir: &Path, backup: &Path, replaced: &[String]) {

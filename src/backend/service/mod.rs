@@ -349,31 +349,12 @@ pub(crate) fn today() -> String {
     rfc3339(seconds + 8 * 3600)[..10].to_owned()
 }
 
-/// 解密缓存（聊天数据库）是否已经生成。
+/// 解密缓存（聊天数据库）探测 —— 与主控台界面共用同一份实现（`shared/cache.rs`）。
 ///
-/// **路径必须是 `<key-dir>/cache/`**。AICRM-Key.exe 抓完密钥后把解密出来的库放在
-/// 这里，文件名是库路径的哈希（如 `451f45d20f33427e.db`），账号目录里的
-/// `config.json` 写得明明白白：`"decrypted_dir": "cache"`，相对 key-dir 解析。
-///
-/// 之前只查 `<key-dir>/<wxid>/cache/` —— 那个目录从来不存在，于是**明明已经解密好
-/// 的机器被一直判成「未找到本地数据库」**：云端 online 恒为 false、采集任务一条都
-/// 下发不出去，界面还显示"密钥不完整"。老布局（wxid 子目录下）也一并认。
-pub(crate) fn decrypted_cache_ready(keys: &Path, wxid: &str) -> bool {
-    let candidates = [keys.join("cache"), keys.join(wxid).join("cache")];
-    candidates.iter().any(|dir| has_db_file(dir))
-}
-
-fn has_db_file(dir: &Path) -> bool {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
-        entry
-            .path()
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("db"))
-    })
-}
+/// 转发而不是重写：这份判定曾经在服务与界面各有一份副本，注释里还写着
+/// "改的时候两边都要改"，而它对应的正是"明明已解密却被判未就绪、云端一条任务
+/// 都下发不出来"那种事故。
+pub(crate) use crate::backend::cache::decrypted_cache_ready;
 
 /// 把本次的启动命令行写进 `<data>/state/startup.json`。
 ///

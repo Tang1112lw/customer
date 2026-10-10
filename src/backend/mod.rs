@@ -1,4 +1,9 @@
+#[path = "../shared/sha256.rs"]
 pub(crate) mod sha256;
+#[path = "../shared/cache.rs"]
+pub(crate) mod cache;
+#[path = "../shared/self_name.rs"]
+pub(crate) mod self_name;
 pub mod service;
 pub mod tools_api;
 
