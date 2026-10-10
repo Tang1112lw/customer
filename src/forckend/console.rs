@@ -104,92 +104,13 @@ fn main() -> eframe::Result {
     )
 }
 
-/// 启动后台服务的命令。参数与 `install.ps1` 写进自启项的完全一致，
-/// 云端三项凭据齐全时才接云端命令通道（跟服务自己的判断保持一致）。
-/// 服务的启动参数。三处共用：直接拉起服务、写开机自启项、改云端地址时重写自启项。
-///
-/// 云端三项凭据齐全才接命令通道（跟服务自己的判断保持一致）；网页来源白名单跟着
-/// `cloud.url` 走，否则云端换了地址之后网页端就再也拿不到本机令牌。
-fn service_args() -> Vec<String> {
-    let dir = install_dir();
-    let mut args = vec![
-        "--tools-dir".to_owned(),
-        dir.join("tools").to_string_lossy().into_owned(),
-        "--key-dir".to_owned(),
-        dir.join("accounts").to_string_lossy().into_owned(),
-        "--data-dir".to_owned(),
-        dir.join("data").to_string_lossy().into_owned(),
-        "--token-file".to_owned(),
-        dir.join("api.token").to_string_lossy().into_owned(),
-        "--bind".to_owned(),
-        BIND.to_owned(),
-    ];
-    let (cloud, token, device) = (
-        dir.join("cloud.url"),
-        dir.join("device.token"),
-        dir.join("device.id"),
-    );
-    if cloud.is_file() && token.is_file() && device.is_file() {
-        args.push("--cloud-url-file".to_owned());
-        args.push(cloud.to_string_lossy().into_owned());
-        args.push("--device-token-file".to_owned());
-        args.push(token.to_string_lossy().into_owned());
-        args.push("--device-id".to_owned());
-        args.push(read_trimmed(&device));
-    }
-    let url = read_trimmed(&cloud);
-    if !url.is_empty() {
-        args.push("--allow-origin".to_owned());
-        args.push(url);
-    }
-    args
-}
-
+/// 启动后台服务的命令。**不带任何参数** —— 服务默认从自己所在目录读
+/// tools/accounts/data/凭据文件，云端三项（cloud.url / device.token / device.id）
+/// 也现读现用。参数拼装与"改一处漏一处"的自启项同步在这里整体消失。
 fn service_command() -> Command {
     let mut command = Command::new(install_dir().join("aicrm_windows_api.exe"));
+    command.creation_flags(CREATE_NO_WINDOW);
     command
-        .args(service_args())
-        .creation_flags(CREATE_NO_WINDOW);
-    command
-}
-
-/// 把开机自启项重写成当前参数（HKCU Run）。
-///
-/// 改云端地址时必须同步它 —— 自启项是"下次开机用什么参数启动"的唯一来源，
-/// 只改 `cloud.url` 的话，重启后网页端白名单还停在旧地址上。
-fn write_run_entry() -> Result<(), String> {
-    let exe = install_dir().join("aicrm_windows_api.exe");
-    let quoted = service_args()
-        .iter()
-        .map(|arg| format!("\"{arg}\""))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let value = format!("\"{}\" {}", exe.display(), quoted);
-    // 走 -File 而不是 -Command：`powershell -Command "..."` 会把命令行再解析一遍，
-    // 值里的双引号会被吃掉（实测过）。写进脚本文件就没有这层解析。
-    let script = std::env::temp_dir().join("aicrm-set-run.ps1");
-    // PowerShell 单引号串里反斜杠是字面量，只需把单引号翻倍转义
-    std::fs::write(
-        &script,
-        format!(
-            "Set-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' \
-             -Name 'AICRM-Windows-API' -Value '{}' -Force",
-            value.replace('\'', "''")
-        ),
-    )
-    .map_err(|error| format!("无法写临时脚本：{error}"))?;
-    let _ = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            &script.to_string_lossy(),
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|error| format!("无法更新自启项：{error}"))?;
-    Ok(())
 }
 
 fn read_trimmed(path: &Path) -> String {
@@ -719,8 +640,9 @@ impl Console {
 
     /// 保存云端地址。
     ///
-    /// 服务每次请求都重读 `cloud.url`，所以下一轮心跳（≤20 秒）就用新地址 ——
-    /// 不用重启服务，也不需要重新配对：设备身份在 `device.id` / `device.token` 里，
+    /// 服务每轮心跳都重读 `cloud.url`，所以下一轮（≤20 秒）就用新地址 ——
+    /// 不用重启服务、不需要动自启项（它只写 exe 路径，没有地址参数）、
+    /// 也不需要重新配对：设备身份在 `device.id` / `device.token` 里，
     /// 只要云端还是同一个库，客户端换地址后照样被认出来。
     fn save_cloud(&mut self) {
         let Some(draft) = self.editing.take() else {
@@ -737,10 +659,7 @@ impl Console {
             self.editing = Some(draft);
             return;
         }
-        self.note = Some(match write_run_entry() {
-            Ok(()) => "已保存：下一轮心跳即用新地址，自启项同步更新".to_owned(),
-            Err(error) => format!("地址已生效，但{error}"),
-        });
+        self.note = Some("已保存：下一轮心跳即用新地址".to_owned());
         self.refresh();
     }
 }

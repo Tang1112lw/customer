@@ -31,9 +31,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(flag) = args.next() {
         if flag == "--help" {
             println!(
-                "AICRM Windows API:\n  \
+                "AICRM Windows API（参数全部可选）：\n  \
+                 缺省时一切从 exe 同目录读：tools/、accounts/、data/、api.token、\n  \
+                 cloud.url（云端地址）、device.token / device.id（设备身份）。\n  \
                  --tools-dir DIR --key-dir DIR --data-dir DIR --token-file FILE --bind IP:PORT\n  \
-                 命令通道（可选，三项齐全才启用）：\n  \
+                 命令通道（可选，凭据齐全才启用）：\n  \
                  --cloud-url URL            云端基地址，如 https://api.example.com\n  \
                  --cloud-url-file FILE      从文件读云端基地址。隧道地址会变时用这个：\n  \
                                             改文件即可，不用重装（每轮轮询都会重读）\n  \
@@ -93,25 +95,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 参数解析完毕，data 目录已确定，这时才能找「已就绪」的更新。
-    // 文件优先于命令行：命令行里的令牌会出现在进程列表和 HKCU Run 自启项中。
-    let device_token = match (device_token_file, device_token) {
-        (Some(path), _) => Some(std::fs::read_to_string(&path).map_err(|error| {
-            io::Error::other(format!("读取设备令牌文件 {} 失败：{error}", path.display()))
-        })?),
-        (None, inline) => inline,
-    }
-    .map(|token| token.trim().to_owned())
-    .filter(|token| !token.is_empty());
+    // 设备令牌：exe 旁的 `device.token` **优先于一切命令行参数** —— 文件是唯一事实
+    // 来源，老版本自启项里钉着的参数不会再和文件打架（README 里「设备身份有两处、
+    // 必须一致」那个坑的结构性正解）。文件不存在时才回落到命令行（旧部署 / 联调）。
+    // 顺带的安全性：命令行里的令牌会出现在进程列表和 HKCU Run 自启项中。
+    let device_token = match read_trimmed(&root.join("device.token")) {
+        Some(token) => Some(token),
+        None => match (device_token_file, device_token) {
+            (Some(path), _) => Some(std::fs::read_to_string(&path).map_err(|error| {
+                io::Error::other(format!("读取设备令牌文件 {} 失败：{error}", path.display()))
+            })?),
+            (None, inline) => inline,
+        }
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty()),
+    };
+
+    // 设备 ID：同样文件优先。
+    let device_id = read_trimmed(&root.join("device.id")).or(device_id);
 
     backend::set_allowed_origins(allow_origins);
+    // 云端地址：exe 旁的 `cloud.url` 存在时即为唯一事实来源（隧道地址会变，改文件
+    // 即可、不用重装；每轮轮询都会重读）。参数仅在文件缺失时兜底。
     // 客户端连哪个云端，就自动信任来自该云端地址的网页 —— 不用为部署地址改代码。
+    let default_cloud = root.join("cloud.url");
+    let (cloud_url, cloud_url_file) = if default_cloud.is_file() {
+        (None, Some(default_cloud))
+    } else {
+        (cloud_url, cloud_url_file)
+    };
     backend::set_cloud_origin(cloud_url.clone(), cloud_url_file.clone());
 
     // 令牌文件路径后面还要给设备认领用（读登录令牌），这里保留一份。
     let service = Service::new(tools, keys, data, token_file.clone())?;
 
-    // 云端地址可以来自命令行，也可以来自文件 —— 隧道地址会变时用文件更方便：
-    // 改文件即可，不用重装客户端。两者至少要有一个。
+    // 云端三项凭据（地址 + 设备令牌 + 设备 ID）齐全才启用命令通道；缺任一就只跑本地 API。
     if let (Some(device_token), Some(device_id)) = (device_token, device_id)
         && (cloud_url.is_some() || cloud_url_file.is_some())
     {
@@ -144,4 +162,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
     Ok(())
+}
+
+/// 读一个"一行文本"配置文件；不存在或为空白返回 `None`。
+///
+/// 与服务共处的 `cloud.url` / `device.token` / `device.id` 都用它读 ——
+/// 判定口径一致（去空白、空文件不算存在）。
+fn read_trimmed(path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
 }

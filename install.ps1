@@ -128,7 +128,6 @@ if (-not (Test-Path -LiteralPath $tokenFile)) {
 # 注意：PowerShell 变量名大小写不敏感，这里不能用 $deviceId 承接参数 $DeviceId ——
 # 初始化赋值会把参数本身清空。所以本地用一个明确不同的名字。
 $cloudDeviceId = ''
-$cloudArguments = ''
 if ($CloudUrl) {
     if (Test-Path -LiteralPath $deviceFile) {
         # 重装沿用既有身份，避免云端把同一台机器认成两台
@@ -176,10 +175,10 @@ if ($CloudUrl) {
     }
 
     # 云端地址写进文件，而不是只钉在命令行/自启项里。
-    # 隧道地址变了（cloudflared 重开、域名轮换）只要改这个文件再重启服务即可，不用重装。
+    # 服务每轮心跳都重读它 —— 隧道地址变了（cloudflared 重开、域名轮换）
+    # 只要改这个文件再重启服务即可，不用重装。
     $cloudUrlFile = Join-Path $InstallDir 'cloud.url'
     [IO.File]::WriteAllText($cloudUrlFile, $CloudUrl.TrimEnd('/'), [Text.Encoding]::ASCII)
-    $cloudArguments = ' --cloud-url-file "{0}" --device-token-file "{1}" --device-id "{2}"' -f $cloudUrlFile, $deviceTokenFile, $cloudDeviceId
 }
 
 # ---- 收紧敏感文件的权限 ----
@@ -218,16 +217,29 @@ foreach ($shortcutPath in $shortcutTargets) {
 }
 
 # ---- 注册自启并立即启动 ----
-$originArgs = ''
+# 自启项默认**只写一行 exe 路径**：服务从自身所在目录读 tools/accounts/data/凭据文件，
+# 云端地址读 cloud.url、设备身份读 device.token / device.id —— 参数拼装整体消失，
+# 「改了文件不重装没用 / 设备身份两处必须一致」的坑从结构上不再存在。
+# 只有非常规配置才继续写参数：自定义密钥目录 / 监听地址、额外的网页来源。
+$extraArguments = ''
+if ($KeyDir.TrimEnd('\') -ne (Join-Path $InstallDir 'accounts').TrimEnd('\')) {
+    $extraArguments += ' --key-dir "{0}"' -f $KeyDir
+}
+if ($Bind -ne '127.0.0.1:8765') {
+    $extraArguments += ' --bind "{0}"' -f $Bind
+}
 if ($AllowOrigin) {
     foreach ($origin in ($AllowOrigin -split ',')) {
-        if ($origin.Trim()) { $originArgs += ' --allow-origin "{0}"' -f $origin.Trim() }
+        if ($origin.Trim()) { $extraArguments += ' --allow-origin "{0}"' -f $origin.Trim() }
     }
 }
-$arguments = '--tools-dir "{0}" --key-dir "{1}" --data-dir "{2}" --token-file "{3}" --bind "{4}"{5}{6}' -f $tools, $KeyDir, $data, $tokenFile, $Bind, $cloudArguments, $originArgs
 New-Item -Path $runKey -Force | Out-Null
-Set-ItemProperty -Path $runKey -Name 'AICRM-Windows-API' -Value ('"{0}" {1}' -f $exe, $arguments)
-Start-Process -FilePath $exe -ArgumentList $arguments -WorkingDirectory $InstallDir -WindowStyle Hidden
+Set-ItemProperty -Path $runKey -Name 'AICRM-Windows-API' -Value ('"{0}"{1}' -f $exe, $extraArguments)
+if ($extraArguments) {
+    Start-Process -FilePath $exe -ArgumentList $extraArguments.Trim() -WorkingDirectory $InstallDir -WindowStyle Hidden
+} else {
+    Start-Process -FilePath $exe -WorkingDirectory $InstallDir -WindowStyle Hidden
+}
 
 # 主窗口自带通知区托盘（同一个进程），开机只静默进托盘，不弹窗口打扰客户。
 Set-ItemProperty -Path $runKey -Name 'AICRM-客户端' -Value ('"{0}" --hidden' -f $consoleExe)
