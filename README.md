@@ -4,20 +4,21 @@
 
 ## 程序清单
 
-`Cargo.toml` 声明六个二进制（其中 `aicrm-pack` 是打包工具，不随客户端分发）：
+`Cargo.toml` 声明五个二进制（其中 `aicrm-pack` 是打包工具，不随客户端分发）：
 
 | 二进制 | 入口 | 作用 | 用法 |
 | --- | --- | --- | --- |
-| `aicrm_windows_api` | `src/main.rs` | 后台服务：HTTP 接口 + 云端命令通道 | 无界面，由 `HKCU\...\Run` 隐藏启动 |
-| `aicrm-login` | `src/forckend/main.rs` | 登录窗口（egui） | `--endpoint` / `--token-file` / `--device-file`，见下 |
-| `aicrm-console` | `src/forckend/console.rs` | 主窗口：侧边栏 + 状态总览（云端 / 密钥 / 服务）+ 配置页 + 账号菜单；**托管本地服务**；**首次未配对时显示「连接云端」引导页**；托盘形态由 `--hidden` 提供（原独立托盘程序已并入） | 无参数；`--hidden` 只进托盘不弹窗；`--start-service` 只起服务不显示窗口 |
-| `aicrm-update` | `src/update/main.rs` | **原生更新器**（取代 PowerShell 脚本）：校验摘要与目标名白名单 → 先停客户端进程 → 备份 → 覆盖 → 按 `startup.json` 重启 → 探活失败回滚；也承担快捷方式创建（`--ensure-shortcut`） | 由服务在应用更新时拉起；`--ensure-shortcut` 供安装脚本调用 |
+| `aicrm_windows_api` | `src/main.rs` | 后台服务：HTTP 接口 + 云端命令通道。参数全部可选，默认从 exe 同目录读配置 | 无界面，由 `HKCU\...\Run` 隐藏启动 |
+| `aicrm-console` | `src/forckend/console.rs` | 主窗口：侧边栏 + 状态总览（云端 / 密钥 / 服务）+ 配置页 + 账号菜单；**登录 / 重新登录 / 首次「连接云端」配对都在这一窗口内完成**；**托管本地服务**；托盘形态由 `--hidden` 提供（原独立托盘程序已并入） | 无参数；`--hidden` 只进托盘不弹窗；`--start-service` 只起服务不显示窗口 |
+| `aicrm-update` | `src/update/main.rs` | **原生更新器**（取代 PowerShell 脚本）：校验摘要与目标名白名单 → 先停客户端进程 → 备份 → 覆盖 → 按 `startup.json` 重启 → 探活失败回滚；也承担快捷方式创建（`--ensure-shortcut`）与旧程序清理 | 由服务在应用更新时拉起；`--ensure-shortcut` 供安装脚本调用 |
 | `aicrm-setup` | `src/forckend/setup.rs` | **静默安装**：不问任何东西，打开即装盘 → 装完自动拉起客户端 → 自己退出 | `--endpoint`；`--extract-only` 自检内嵌载荷。单文件形态由 `aicrm-pack` 拼出 |
 | `aicrm-pack` | `src/pack/main.rs` | 打包工具：安装器 + 全部载荷 → 单文件安装程序 | `cargo run --release --bin aicrm-pack [输出路径]` |
 
+（`aicrm-login.exe` 登录窗口已于 2026-10-10 并入主控台，不再分发。）
+
 四件事值得记一笔：
 
-- **外观统一**：`src/forckend/theme.rs` 是三个窗口共用的外观（浅色底、白卡片、描边、留白），各自 `mod theme;` 指向同一份文件，不引入共享库。
+- **外观统一**：`src/forckend/theme.rs` 是两个窗口（主控台、安装器）共用的外观（浅色底、白卡片、描边、留白），各自 `mod theme;` 指向同一份文件，不引入共享库。跨二进制共享的无界面工具统一在 `src/shared/`（路径约定 / 设备凭据 / 进程管理 / 字体 / 缓存探测 / 机主昵称），各二进制按需引入。
 - **主窗口不依赖服务**：它直接读安装目录里的文件（令牌、密钥、`cloud.url`、`data/jobs`），因为它的职责之一就是"服务没跑时把服务拉起来"。宽高固定、长文本截断，避免窄窗口把中文挤成竖排。
 - **单文件安装程序**：`aicrm-pack` 把 `aicrm-setup.exe` 与载荷 zip 拼在一起，页脚 `[offset u64][len u64]["AICRMSFX"]`；安装器启动时读自身末尾定位并解压载荷，没有页脚就退回"同目录"布局。载荷清单在 `src/pack/main.rs` 顶部。输出名是 `AICRM-<版本号>.exe`，版本号取自 `Cargo.toml`，不用手工同步。
 - **一个时间只有一个界面**：`src/forckend/single.rs` 用命名互斥体 `Local\AICRM.WinClient` 做单实例，主界面与安装器**共用同一把锁**，所以两者不会并排出现。重复启动时把已有窗口 `SW_RESTORE` + 置前，而不是再开一个。开窗前先 `acquire()`；安装器装完要拉起主界面前必须 `release()`，否则主界面会被自己那把锁挡掉（表现为"装完了但客户端弹不出来"）。
@@ -27,7 +28,7 @@
 
 ## 安装与运行
 
-在本项目目录运行 `./install.ps1`。脚本编译 Rust 程序，把客户端四件套（`aicrm_windows_api.exe` / `aicrm-console.exe` / `aicrm-login.exe` / `aicrm-update.exe`）、`AICRM-Key.exe` 与 Markdown 导出程序放到 `%LOCALAPPDATA%\AICRM-Windows-API\`，生成权限限定为当前用户、SYSTEM 和管理员的 `api.token`，注册登录自启并立即启动。现有密钥仍读取本项目 `src\tools\accounts\`，不会复制或删除。服务默认监听 `127.0.0.1:8765`。需要更换密钥目录或监听地址时使用 `./install.ps1 -KeyDir 'D:\密钥目录' -Bind '127.0.0.1:8765'`。重新运行安装脚本会更新程序并重启服务，不会更换已有 token。
+在本项目目录运行 `./install.ps1`。脚本编译 Rust 程序，把客户端三件套（`aicrm_windows_api.exe` / `aicrm-console.exe` / `aicrm-update.exe`）、`AICRM-Key.exe` 与 Markdown 导出程序放到 `%LOCALAPPDATA%\AICRM-Windows-API\`，生成权限限定为当前用户、SYSTEM 和管理员的 `api.token`，注册登录自启并立即启动。现有密钥仍读取本项目 `src\tools\accounts\`，不会复制或删除。服务默认监听 `127.0.0.1:8765`。需要更换密钥目录或监听地址时使用 `./install.ps1 -KeyDir 'D:\密钥目录' -Bind '127.0.0.1:8765'`（这两个非常规值会自动写进自启项参数；常规部署自启项只有一行 exe 路径）。重新运行安装脚本会更新程序并重启服务，不会更换已有 token。
 
 ### 设备归属：会话制（2026-10-09 起）
 
@@ -78,41 +79,33 @@ PUT /api/agent/v1/status
 
 两个坑：
 
-- 覆盖文件前脚本会停掉 `aicrm_windows_api` / `aicrm-console` / `aicrm-login` / `aicrm-tray`，否则 `Copy-Item` 报「文件正由另一进程使用」。**客户端自己调脚本时必须加 `-KeepConsole`** —— 不然脚本会把调用者停掉，表现为"点了连接、窗口直接消失"。
+- 覆盖文件前脚本会停掉 `aicrm_windows_api` / `aicrm-console` / `aicrm-login`（旧版残留，顺带清理），否则 `Copy-Item` 报「文件正由另一进程使用」。**客户端自己调脚本时必须加 `-KeepConsole`** —— 不然脚本会把调用者停掉，表现为"点了连接、窗口直接消失"。
 - 装完脚本会把自身复制一份到安装目录，就是供客户端配对时复用。
 
 采集闭环只依赖 `aicrm-export-new.exe`，它由 `install.ps1 -ExportProgram` 复制进 `tools\`，也是 `Service::new` 的启动校验项，缺它服务起不来。不再依赖 `AICRM-Export.exe`。
 
-### 换云端 / 重装前必读：设备身份有两处
+### 换云端 / 重装前必读：一切以文件为准
 
-云端认的是 `--device-id`，它出现在**两个地方**，必须一致，否则心跳恒定 `401 Unauthorized`：
+**设备身份与云端地址只有一个事实来源 —— 安装目录里的文件**（`device.id`、`device.token`、`cloud.url`）。服务默认从自己所在目录读它们，且**文件存在时优先于任何命令行参数**；自启项只写一行 exe 路径、不带参数。所以「改了文件不重装没用 / 自启项里的 `--device-id` 和文件不一致」这类坑从结构上不存在了（2026-10-10 重构起）。
 
-1. `%LOCALAPPDATA%\AICRM-Windows-API\device.id` 与 `device.token`
-2. **`HKCU Run\AICRM-Windows-API` 自启项里写死的 `--device-id`** ← 最容易漏，改了文件不重装是没用的
-
-而且 `install.ps1` **只在传了 `-CloudUrl` 时**才把 `--cloud-url-file` / `--device-token-file` / `--device-id` 拼进启动参数和自启项。不带 `-CloudUrl` 装出来的服务根本不连云端。
-
-已接入云端时重装**不需要再配对**（`device.token` 存在就会沿用），但**仍要带 `-CloudUrl`**，否则自启项里没有云端参数。确认彻底换云端才删 `device.id` + `device.token` 重新走配对。
+- **换隧道地址**：改 `cloud.url` 再重启服务（或等服务下一轮心跳，每轮都重读），不用重装。
+- **彻底换云端**：删 `device.id` + `device.token`，在客户端「连接云端」页重新配对。
+- **已接入云端时重装不需要再配对**（`device.token` 存在就会沿用），但 **`install.ps1` 仍要带 `-CloudUrl`**，否则 `cloud.url` 不会被写。
+- 老版本装出来的机器：自启项里可能还带着旧参数——服务按"文件优先"处理，它们不再能造成不一致；下次重装 / 修复安装时自启项会被重写为裸路径。
 
 验通标准：云端设备列表里这台从 `never_seen` 变成 `offline` / `online`。仍是 `never_seen` 就看 `client.err.log` 有没有 `401 Unauthorized`。
 
 `./uninstall.ps1` 只删除登录自启项并停止服务，保留程序、密钥、token 和导出文件。手动启动命令可查看 `install.ps1` 写入的 `HKCU:\Software\Microsoft\Windows\CurrentVersion\Run\AICRM-Windows-API` 值。
 
-## 登录窗口
+## 登录（主控台内）
 
-`aicrm-login.exe` 是给 Windows 客户端用的图形程序（`src/forckend/`），与后台服务分开：用户在这里输入账号密码，向云端换取**会话令牌**，写进本地令牌文件供后台服务鉴权。**密码完全由云端校验**，本地不保存、不比对 —— 本地校验等于在客户端藏一份密码哈希，可被替换或绕过。
+登录**不再是独立程序**（`aicrm-login.exe` 已于 2026-10-10 并入主控台）：主控台的「连接云端」页 —— 首次打开未配对时自动出现，也可从右上角账号菜单「重新登录」进入 —— 完成全部登录动作：输入账号密码、向云端换取**会话令牌**、写进本地令牌文件供后台服务鉴权。**密码完全由云端校验**，本地不保存、不比对 —— 本地校验等于在客户端藏一份密码哈希，可被替换或绕过。
 
-```powershell
-./target/release/aicrm-login.exe --endpoint https://你的云端/api/auth/login
-```
-
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `--endpoint` | `http://127.0.0.1:8000/api/auth/login` | 云端登录接口，**正式环境必须 HTTPS** |
-| `--token-file` | `%LOCALAPPDATA%\AICRM-Windows-API\api.token` | 会话令牌写入位置，与后台服务读取的是同一个文件 |
-| `--device-file` | `%LOCALAPPDATA%\AICRM-Windows-API\device.id` | 设备标识，首次运行生成后固定不变 |
-
-令牌文件写好后会尽力用 `icacls` 把权限收紧到当前用户 / SYSTEM / Administrators。**后台服务需重启才会读取新令牌**（服务的令牌是启动时读一次）。
+- 云端地址取自 `cloud.url`（首次安装由 `install.ps1 -CloudUrl` 写入；本机联调可手动改）。
+- 登录成功后一次写好三个文件：`account.name`（界面显示"谁登录了"）、`api.token`（会话令牌，尽力用 `icacls` 收紧权限到当前用户 / SYSTEM / Administrators）、`api.refresh`（续期用）。
+- **已配对的机器**：登录到此为止，服务会在几秒内自动重启换用新令牌（服务启动时读一次令牌）。
+- **首次未配对的机器**：紧接着自动申领配对码并调用 `install.ps1` 完成设备落盘（见「安装与配对是两件事」）。
+- 退出登录：账号菜单「退出登录」换一把新的本地令牌、清掉账号名，并**删掉 `api.refresh`** —— 不删的话续期任务会在 30 分钟内用刷新令牌把用户悄悄"登回来"（2026-10-10 修的 bug）。
 
 ### 云端登录接口契约
 
@@ -149,7 +142,9 @@ Content-Type: application/json
 
 ```powershell
 Start-Process pwsh -ArgumentList '-NoProfile','-File','.\mock-cloud.ps1','-Port','9413','-LogFile',"$env:TEMP\req.txt" -WindowStyle Hidden
-./target/debug/aicrm-login.exe --endpoint http://127.0.0.1:9413/api/auth/login --token-file "$env:TEMP\api.token"
+# 让主控台连到这个假云端，然后打开主控台的「连接云端」页登录：
+Set-Content "$env:LOCALAPPDATA\AICRM-Windows-API\cloud.url" 'http://127.0.0.1:9413' -NoNewline
+start .\target\debug\aicrm-console.exe
 ```
 
 `req.txt` 会记下客户端实际发出的原始请求，便于核对契约。
@@ -165,9 +160,9 @@ Start-Process pwsh -ArgumentList '-NoProfile','-File','.\mock-agent-cloud.ps1','
 
 ## 接口
 
-除下面单列的握手端点外，所有接口都要求 `Authorization: Bearer <token>`，token 在 `%LOCALAPPDATA%\AICRM-Windows-API\api.token`。接口层只解析请求、调用 `backend/service/` 的函数。该目录按辅助程序拆分：`service/mod.rs` 是共享底座（服务状态、进程调用、并发闸门、`authorize` 鉴权中间件），`service/key_service.rs` 承载 `AICRM-Key.exe` 业务（密钥准备、账号查询），`service/export_service.rs` 承载 `aicrm-export-new.exe` 业务（Markdown 导出执行、结果打包与 NDJSON），`service/archive_service.rs` 承载 Markdown 归档打包与上传（数据采集闭环上半段），`service/agent_service.rs` 是云端命令通道（长轮询 + 心跳）。
+除下面单列的握手端点外，所有接口都要求 `Authorization: Bearer <token>`，token 在 `%LOCALAPPDATA%\AICRM-Windows-API\api.token`。接口层只解析请求、调用 `backend/service/` 的函数。该目录按辅助程序拆分：`service/mod.rs` 是共享底座（服务状态、进程调用、并发闸门、`authorize` 鉴权中间件），`service/key_service.rs` 承载 `AICRM-Key.exe` 业务（密钥准备、账号查询），`service/export_service.rs` 承载 `aicrm-export-new.exe` 业务（Markdown 导出执行），`service/archive_service.rs` 承载 Markdown 归档打包与上传（数据采集闭环上半段），`service/agent_service.rs` 是云端命令通道（长轮询 + 心跳）。跨二进制共享的无界面工具在 `src/shared/`（路径约定 / 设备凭据 / 进程管理 / 缓存探测 / 机主昵称）。
 
-鉴权不在各模块内单独实现，而是在 `backend/mod.rs` 的 `app()` 里通过唯一的 `route_layer` 统一施加到全部已注册路由上。新增模块只需写一个 `pub fn router() -> Router<Arc<Service>>` 并在 `app()` 中 `merge` 一行，其所有接口自动受保护，无需写任何鉴权代码；所有 `merge` 都必须写在 `route_layer` 之前。用 `route_layer` 而非 `layer`，是为了让未匹配的路径保持 404 而不是变成 401。`backend/mod.rs` 的测试会遍历表里全部 11 个接口，确认无 token、错 token、其它认证方案均返回 401。
+鉴权不在各模块内单独实现，而是在 `backend/mod.rs` 的 `app()` 里通过唯一的 `route_layer` 统一施加到全部已注册路由上。新增模块只需写一个 `pub fn router() -> Router<Arc<Service>>` 并在 `app()` 中 `merge` 一行，其所有接口自动受保护，无需写任何鉴权代码；所有 `merge` 都必须写在 `route_layer` 之前。用 `route_layer` 而非 `layer`，是为了让未匹配的路径保持 404 而不是变成 401。`backend/mod.rs` 的测试会遍历表里全部 8 个接口，确认无 token、错 token、其它认证方案均返回 401。
 
 | 方法 | 路径 | 功能 |
 | --- | --- | --- |
@@ -178,18 +173,11 @@ Start-Process pwsh -ArgumentList '-NoProfile','-File','.\mock-agent-cloud.ps1','
 | GET | `/api/aicrm/accounts` | 列出本地已保存密钥的 wxid，不返回密钥 |
 | POST | `/api/aicrm/prepare` | 验证或捕获密钥；缺少有效密钥时辅助程序可能重启微信 |
 | POST | `/api/aicrm/export` | 运行导出，文件保留在本地 `data\jobs\`，返回结果与路径 |
-| POST | `/api/aicrm/export/stream` | 运行导出，返回本次每个 `messages.json` 文档的 NDJSON；不含附件字节 |
-| POST | `/api/aicrm/export/bundle` | 下载原始 JSON 和附件 ZIP |
-| POST | `/api/aicrm/export/ai-bundle` | 下载原始 JSON、附件及精简 `chat.txt` ZIP |
 | POST | `/api/aicrm/collect` | 数据采集：后台导出、合并归档包并上传云端；**立即返回 202，不等导出跑完**（当前由云端下发的 `wechat.collect` 触发；本机接口保留兼容） |
 
 导出请求示例：`{"wxid":"wxid_xxx","day":14}`。`wxid` 可省略，由辅助程序识别当前账号；`person` 可限定联系人或群名；`day` 为含今天的最近 N 天；`start` 与 `end` 必须同时提供，且不能和 `day` 同用。`task_id`、`wechat_dir` 可选；`export_dir` 是云端指定的落盘目录，给了就直接导到那里（不清理、不删），不给才用 `data\jobs\<id>` 临时目录。请求体带 `deny_unknown_fields`，字段名写错会立刻 422 而不是被静默忽略。未指定联系人和日期即导出全部历史。每个请求使用独立导出目录，所以多个导出可并发；密钥准备操作与导出互斥（同一个 `RwLock` 闸门）。
 
 `/api/aicrm/collect` 的请求体是另一套字段，全部必填：`task_id`、`execution_token`、`user_token`、`upload_url`（形如 `https://云端/api/tasks/<taskId>/upload`），加上与导出同名的可选筛选 `wxid` / `person` / `day` / `start` / `end`。它**不能在请求里等到底**：导出要跑几分钟，挂在请求里的话调用方一断开连接、handler 就被丢弃，采集被一起取消（归档目录写到一半不动、云端任务永远停在 `created`，实测踩过）。所以它只把活儿丢进后台就回 202，进度由客户端上报，网页轮询 `GET /api/tasks/{id}` 查看。上传用 multipart，字段名必须是 `file`，并同时带 `X-Execution-Token` 与 `Authorization: Bearer <user_token>` —— 只带执行令牌会被云端 401。
-
-`/stream` 的格式是 Windows 专用 `aicrm-windows-files/v1`：首行 `meta`，每个文件一行 `{"type":"file","path":".../messages.json","document":{...}}`，末行 `summary`。它不伪装成 Android 的 `aicrm-compact/v1`。需要语音、图片等附件时调用 ZIP 接口。
-
-AI ZIP 中 `chat.txt` 按会话和日期分组，保留消息顺序、发送方向及文本。群消息在源数据有成员信息时标注成员。语音只写 `[语音:相对路径]`；原程序未导出音频文件的语音写 `[语音]`。原始 `messages.json` 和附件逐字节保留在 ZIP 对应目录，用于核对。ZIP 或 NDJSON 响应完成或连接中断后，服务会删除本次临时导出文件；`/export` 返回的本地文件则保留，需自行清理。
 
 ### 握手端点与 CORS
 
@@ -205,20 +193,20 @@ CORS 中间件包在最外层（比鉴权还外）：预检 `OPTIONS` 不带 `Au
 
 ### 命令行参数（后台服务）
 
+**全部可选**：缺省时从 exe 所在目录读 `tools\` / `accounts\` / `data\` / `api.token` / `cloud.url` / `device.token` / `device.id`。云端三项凭据（地址 / 设备令牌 / 设备 ID）**文件存在时优先于任何命令行参数** —— 文件是唯一事实来源，老自启项里钉着的参数不会再和文件打架。
+
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `--tools-dir` / `--key-dir` / `--data-dir` / `--token-file` | 可执行文件同级的 `tools\` / `accounts\` / `data\` / `api.token` | 目录与令牌位置 |
 | `--bind` | `127.0.0.1:8765` | 监听地址 |
 | `--allow-origin` | 见上 | 追加网页来源白名单，可重复 |
-| `--cloud-url` | 无 | 云端基地址，如 `https://api.example.com` |
-| `--cloud-url-file` | 无 | 从文件读云端基地址。**隧道地址会变时用这个**：每轮轮询都重读文件，改文件即可，不用重装 |
-| `--device-token` | 无 | 设备令牌明文写在命令行，仅调试用 |
-| `--device-token-file` | 无 | 设备令牌文件（推荐：不会出现在进程列表和自启项里）。与 `--device-token` 同给时以文件为准 |
-| `--device-id` | 无 | 设备标识 |
+| `--cloud-url` / `--cloud-url-file` | exe 旁 `cloud.url`（存在时自动读） | 云端基地址。**隧道地址会变时改文件即可**：每轮轮询都重读，不用重装 |
+| `--device-token` / `--device-token-file` | exe 旁 `device.token`（存在时自动读） | 设备令牌；命令行明文仅调试用 |
+| `--device-id` | exe 旁 `device.id`（存在时自动读） | 设备标识 |
 
 ### 云端命令通道
 
-客户端装在客户的 Windows 电脑上，位于 NAT 之后、没有公网 IP，云端无法主动连进来，所以方向反过来：客户端定时向云端取命令，执行完回传。**`--device-token*`、`--device-id` 三项齐全，且 `--cloud-url` / `--cloud-url-file` 至少有一个**才启用轮询，否则只跑本地 API。
+客户端装在客户的 Windows 电脑上，位于 NAT 之后、没有公网 IP，云端无法主动连进来，所以方向反过来：客户端定时向云端取命令，执行完回传。**地址 + 设备令牌 + 设备 ID 三项齐全才启用轮询**（默认全部从安装目录的文件读：`cloud.url` / `device.token` / `device.id`），缺任一就只跑本地 API。
 
 - 心跳：每 20 秒 `PUT <cloud>/api/agent/v1/status`。云端靠它判断设备在线，没有心跳网页端就不允许对这台设备下发采集任务。`wechat.online` 要求微信进程在跑、wxid 已绑定、本地库在、密钥就绪，任一不成立就如实报 `false`。
   **心跳还顺带把登录账号带给云端**（`X-AICRM-User-Token`，每次现读 `api.token`）—— 这决定了网页端登录哪个账号才看得见这台客户端，详见下方「设备归属：会话制」。
@@ -237,17 +225,27 @@ $headers = @{ Authorization = "Bearer $token" }
 Invoke-RestMethod "$base/api/aicrm/accounts" -Headers $headers
 
 $body = @{ day = 14 } | ConvertTo-Json -Compress
-Invoke-WebRequest "$base/api/aicrm/export/ai-bundle" -Method Post -Headers $headers `
+Invoke-RestMethod "$base/api/aicrm/export" -Method Post -Headers $headers `
   -ContentType 'application/json; charset=utf-8' `
-  -Body ([Text.Encoding]::UTF8.GetBytes($body)) `
-  -OutFile "$env:USERPROFILE\Desktop\测试\windows-ai.zip"
+  -Body ([Text.Encoding]::UTF8.GetBytes($body))
 ```
 
-2026-09-29 本机真实接口测试：两个导出请求同时执行成功。14 天全联系人 AI ZIP 中有 120 个原始聊天 JSON、2,527 条消息、35 条语音消息，其中 30 个有音频文件、5 个源程序未导出文件。`chat.txt` 有 2,527 条消息行、74,413 字符，无 `<voicemsg>` XML；所有 30 个语音文件引用均可在 ZIP 中找到。NDJSON 有 122 行（meta + 120 文件 + summary），消息数一致。传输后临时任务目录为空。测试产物在 `C:\Users\11589\Desktop\测试\AICRM_Windows_API_20260929\`。服务启动、Bearer 鉴权（无 token 返回 401）及登录自启注册已核对；实际注销后重新登录的自动启动尚未测试。
+2026-09-29 本机真实接口测试：两个导出请求同时执行成功；`chat.txt` 有 2,527 条消息行、74,413 字符，无 `<voicemsg>` XML；语音文件引用均可在 ZIP 中找到。密钥接口用 `no_restart=true` 验证成功，返回值不含密钥正文；`/export` 的本地文件模式返回 185 条消息、5 个 JSON，结果保留在其 `job_dir`。所有帮助接口均返回 200。
 
-随后单独复测最终版 NDJSON，源数据增加至 2,541 条消息，末行 summary 成功且不含已删除的临时路径。密钥接口用 `no_restart=true` 验证成功，返回值不含密钥正文；单联系人原始 ZIP 包含 5 个 JSON 和 2 个音频文件；`/export` 的本地文件模式返回 185 条消息、5 个 JSON，结果保留在其 `job_dir`。两个帮助接口均返回 200。
+（该次测试涉及的 `/export/stream`、`/export/bundle`、`/export/ai-bundle` 三个"下载原始数据"接口，经 2026-10-10 审计确认前端与云命令通道都不再调用，已删除 —— 需要时从 git 历史取回；`/export`（本地文件）与 `/collect`（采集上传）保留。）
 
 ## 更新记录
+
+### 2026-10-10（重构：去重复 · 合并登录窗 · 零参数化 · 删除死接口）
+
+一次刻意"不改变行为"的结构重构，按步提交、可逐步回退：
+
+- **共享层收敛**：新增 `src/shared/`（路径约定 / 设备凭据 / 进程管理 / 字体 / 缓存探测 / 机主昵称），替换原先散在 4-5 处的副本。杀进程名单从 5 处收敛为 1 处；"服务与界面各写一份、改的时候两边都要改"这类注释全部消失。
+- **登录窗合并进主控台**：删除 `aicrm-login.exe` 独立二进制（约 530 行）与"连点几次堆出多个登录窗"的 `FindWindowW` 查重逻辑；登录 / 重新登录 / 首次配对统一走「连接云端」页。**顺手修掉一个 bug：退出登录只换 `api.token` 不删 `api.refresh`，服务的 30 分钟续期会把用户悄悄"登回来"。**
+- **服务零参数化**：服务默认从 exe 同目录读一切，且**文件优先于命令行**；自启项只写一行 exe 路径。删除主控台里 70 余行参数拼装与改注册表代码。「设备身份两处必须一致」的坑从结构上消失。
+- **删除三个已无调用方的接口**：`/export/stream`、`/export/bundle`、`/export/ai-bundle`（审计依据见对应提交，约 190 行）；`async-stream` 依赖一并移除。
+- **死代码清扫**：未使用的常量与函数（`CLIENT_PROGRAMS`、`pair_device`、`default_refresh_file`、`open_main_window`、永为 `None` 的安装器参数等）删除；`aicrm-tray.exe` 残留引用清零；编译警告归零。
+- **迁移兼容**：旧自启项里的参数仍被接受（只是不再生效于文件已有值时）；升级到新版时更新器会自动清理已下线的旧程序；`aicrm-login.exe` 保留在过渡期进程名单里，覆盖"更新瞬间旧登录窗还开着"的机器。
 
 ### 2026-10-10（自更新全自动 · 整包 · 令牌续期 · 采集可靠性）
 
@@ -322,12 +320,13 @@ Invoke-WebRequest "$base/api/aicrm/export/ai-bundle" -Method Post -Headers $head
 客户端每 20 秒心跳一次上报 `agentVersion`；云端发现落后于已发布版本时下发 `agent.update`。
 更新包与指令都**不经过网页** —— 网页只是仪表盘（显示版本落后、提供手动推送按钮）。
 
-- 下载：凭 Device 令牌取 `GET <云端>/api/agent/v1/programs/agent`（整包时逐件再取 `console`、`login`，共三件套；0.1.43 前的旧客户端只认单件），本地 SHA-256 校验。下载超时 600 秒 —— 整包里的界面程序近 10 MB，曾用 45 秒长轮询超时，下载必被误杀
+- 下载：凭 Device 令牌取 `GET <云端>/api/agent/v1/programs/agent`（整包时逐件再取 `console`；0.1.47 起不再有 `login` 件，0.1.43 前的旧客户端只认单件），本地 SHA-256 校验。下载超时 600 秒 —— 整包里的界面程序近 10 MB，曾用 45 秒长轮询超时，下载必被误杀
 - 落盘：`updates/<版本>/` + `updates/pending.json`（**只允许升级写入**：云端换版本快于下载时，后到的旧命令不得覆盖新标记）
 - 应用时机（0.1.33 起）：下载校验就绪后**等空闲自动重启应用** —— 重活计数（采集 / 导出 / 绑定）归零、再留 15 秒把命令回执发出去，然后拉起更新器；一直忙则退回「下次启动」兜底路径
 - 替换：拉起 **`aicrm-update.exe`**（原生 exe，不经解释器）完成：
   宽限期 → 复算摘要 → 校验目标名白名单 → 备份 → 先停客户端进程（含会保活服务的
   主界面）→ 覆盖（遇占用自动重试）→ 按 `data/state/startup.json` 记录的启动命令重启 →
+  清理已下线的旧程序（`aicrm-login` / `aicrm-tray`）→
   刷新桌面/开始菜单快捷方式与图标缓存 → 确认服务存活；失败回滚
 
 三个必须记住的约束：

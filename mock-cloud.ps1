@@ -6,8 +6,8 @@
     [string]$LogFile = ''
 )
 
-# 循环假云端：在没有真云端时演示 / 联调 aicrm-login.exe。响应体必须是客户端要求的
-# `{code,message,data}` 信封（令牌在 data.accessToken），否则登录窗口会报"不是信封 / 缺少 data"。
+# 循环假云端：在没有真云端时演示 / 联调登录流程（主控台「连接云端」页）。响应体必须是客户端要求的
+# `{code,message,data}` 信封（令牌在 data.accessToken），否则登录会报"不是信封 / 缺少 data"。
 # 账号密码匹配则返回 200，否则返回 401。进程常驻，杀掉即结束。
 
 $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)

@@ -133,11 +133,20 @@ fn read_trimmed(path: &Path) -> String {
 /// 配对复用安装脚本而不是在 Rust 里重写：令牌生成（`New-HexToken`）、
 /// 收紧文件权限、重启服务 —— 这些都在那边验证过了。
 fn connect_task(base: &str, username: &str, password: &str) -> Result<String, String> {
+    // 登录请求里的 device_id：已有就带真的，没有就用占位值。
+    // **不能在这里生成 device.id 文件**：设备身份由配对流程签发 —— install.ps1 只在
+    // 文件缺失时才会写入预置码配套的 `-DeviceId`，先落一个随机值会让它被当成
+    // "已有身份"沿用，配对可能拿错身份。
+    let device_arg = std::fs::read_to_string(paths::device_id())
+        .ok()
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "console".to_owned());
     let session = cloud::login(
         &format!("{base}/api/auth/login"),
         username,
         password,
-        &device::device_id(&paths::device_id()),
+        &device_arg,
     )
     .map_err(|error| error.message().to_owned())?;
 
@@ -299,7 +308,7 @@ struct Snapshot {
     wechat_name: Option<String>,
     cloud: Option<(String, String)>,
     jobs: Vec<Job>,
-    /// 已登录的账号名，来自 `account.name`（登录窗口写入）。None = 未登录。
+    /// 已登录的账号名，来自 `account.name`（登录流程写入）。None = 未登录。
     account: Option<String>,
     /// 当前账号在本机绑定的微信号，由服务从云端拉取后缓存。None = 还没拉到。
     bound_wxid: Option<String>,

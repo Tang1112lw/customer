@@ -1,28 +1,13 @@
-//! 设备标识与会话令牌的本地持久化。
+//! 会话令牌与账号名的本地持久化。
 //!
-//! 由原 `forckend/store.rs` 并入：登录窗合并进主控台后，设备凭据的读写不再属于
+//! 设备标识（`device.id`）**不在这里生成**：它是配对流程的产物，由 `install.ps1`
+//! 在配对时写入（预置码配套的 deviceId 必须原样使用），Rust 侧只读不写 ——
+//! 见 console.rs 的 `connect_task`。
+//!
+//! 由原 `forckend/store.rs` 并入：登录窗合并进主控台后，凭据的读写不再属于
 //! 某一个窗口，而是"谁登录谁写"的公共动作。
 
 use std::{fs, io, path::Path, process::Command};
-
-/// 每台客户端唯一的设备标识，持久化后不再变化。
-///
-/// 云端用它区分"同一账号的不同设备"，从而能够**单独撤销某一台**而不影响其他设备。
-/// 文件不存在或为空时生成一个新的 v4 UUID 并落盘。
-pub fn device_id(path: &Path) -> String {
-    if let Ok(existing) = fs::read_to_string(path) {
-        let trimmed = existing.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_owned();
-        }
-    }
-    let generated = uuid::Uuid::new_v4().simple().to_string();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::write(path, &generated);
-    generated
-}
 
 /// 写入会话令牌，并尽力把文件权限收紧到"仅当前用户 + SYSTEM + 管理员"。
 ///
@@ -87,11 +72,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn device_id_is_stable_across_calls() {
+    fn account_name_is_trimmed_and_empty_is_skipped() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("device.id");
-        let first = device_id(&path);
-        assert_eq!(first.len(), 32);
-        assert_eq!(first, device_id(&path));
+        let path = temp.path().join("account.name");
+        save_account(&path, "  张三  ").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "张三");
+        // 空名字不该把已有文件清掉（"未登录"的判定依赖它）
+        save_account(&path, "   ").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "张三");
+    }
+
+    #[test]
+    fn token_is_written_verbatim() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("api.token");
+        // 权限收紧是 best-effort（返回警告不报错），这里只断言内容落盘
+        let _ = save_token(&path, "tok-123").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "tok-123");
     }
 }

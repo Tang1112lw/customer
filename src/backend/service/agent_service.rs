@@ -952,17 +952,13 @@ struct UpdatePart {
 
 /// 自更新允许替换的安装目录文件。与更新器 `ALLOWED_TARGETS` 对齐，
 /// 但不含 `aicrm-update.exe`：更新器自己要活到替换完成，换不了自己。
-const UPDATE_TARGETS: [&str; 3] = [
-    "aicrm_windows_api.exe",
-    "aicrm-console.exe",
-    "aicrm-login.exe",
-];
+const UPDATE_TARGETS: [&str; 2] = ["aicrm_windows_api.exe", "aicrm-console.exe"];
 
 impl Service {
-    /// 客户端自更新：下载 → 校验 → 落盘 → 交接给外部脚本替换重启。
+    /// 客户端自更新：下载 → 校验 → 落盘 → 交接给外部更新器替换重启。
     ///
     /// 本函数返回后主进程仍会正常把命令结果回传云端；真正的替换发生在宽限期之后
-    /// （apply-update.ps1 先停服务进程，再覆盖 exe，最后按自启项把客户端拉起来）。
+    /// （aicrm-update.exe 先停客户端进程，再覆盖 exe，最后按记录的启动命令重启）。
     /// 云端不依赖这次回执判断成败 —— 它看重启后心跳带上来的版本号。
     async fn apply_update(
         &self,

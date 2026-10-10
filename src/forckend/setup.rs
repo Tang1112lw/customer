@@ -447,7 +447,7 @@ impl eframe::App for SetupApp {
         }
         let before = std::mem::discriminant(&self.state);
         self.poll(ctx);
-        // 与登录窗口同理：状态变了必须再要一帧，否则界面不刷新
+        // 与主控台同理：状态变了必须再要一帧，否则界面不刷新
         if matches!(self.state, State::Working(_)) || std::mem::discriminant(&self.state) != before
         {
             ctx.request_repaint();
