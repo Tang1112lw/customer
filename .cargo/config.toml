@@ -1,0 +1,12 @@
+# 静态链接 MSVC 运行库：客户机不需要预装 VC++ 运行库。
+#
+# 为什么必须这么做：安装器自己（aicrm-setup.exe）也是 MSVC 动态链接的。目标机缺
+# vcruntime140.dll 时，它**连启动都做不到** —— 表现就是"双击安装程序没反应"
+# （实测确认：修复前 aicrm-setup / aicrm-console / aicrm_windows_api / aicrm-update
+# 四个程序都依赖 VCRUNTIME140.dll）。
+#
+# 静态链接后我们自己的程序一个运行库都不依赖；随包的第三方程序
+# （AICRM-Key.exe、aicrm-export-new.exe）改不了，所以仍然随包附带
+# `tools\vcruntime140.dll`（应用本地装配，见 install.ps1 与 src/pack/main.rs）。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -1,15 +1,15 @@
 //! AICRM 一键安装（图形界面）。
 //!
-//! 为什么要做成图形安装程序：每台设备都要和云端配对才能被识别，而配对需要一个一次性
-//! 配对码。让客户去开 PowerShell、拼三个参数、还要在 10 分钟内用完 —— 那不是安装体验。
-//! 这里把它收敛成一个窗口：
+//! 为什么要做成图形安装程序：装客户端要在客户机上放文件、注册开机自启、写云端地址，
+//! 还要跑 PowerShell、拼一串参数 —— 那不是安装体验。这里把它收敛成一个窗口：
 //!
 //! ```text
-//! 填云端地址 + 账号 + 密码 → 点「一键安装」
-//!   → 登录云端 → 自动为本机签发配对码 → 配对 → 调用 install.ps1 装盘并注册自启
+//! 点「一键安装」
+//!   → 调用 install.ps1 装盘、注册自启、写入云端地址
 //! ```
 //!
-//! 配对码由本程序自动申领，用户全程不需要看到它。
+//! 账号与密码一概不问：登录由客户端首次打开时的「连接云端」页完成（2026-10-10 起
+//! 没有设备配对，登录即完成接入）。
 //!
 //! 用法：
 //! ```text
@@ -18,7 +18,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-// 共享模块里存在本窗口不引用的项是正常的：登录 / 配对那条路只在主控台里用，
+// 共享模块里存在本窗口不引用的项是正常的：登录那条路只在主控台里用，
 // 这里只用 transport_warning 提示"地址是 http 明文"。
 #[allow(dead_code)]
 mod cloud;
@@ -45,8 +45,36 @@ use std::{
 /// 默认云端地址。打包时按实际部署改这里，用户就不用填了。
 const DEFAULT_ENDPOINT: &str = "http://162.14.83.205";
 
-fn main() -> eframe::Result {
+fn main() {
+    let log = setup_error_log();
+    // 安装器是 GUI：出错时没有控制台可看，静默退出就是"双击没反应"。
+    // 先装兜底（panic 也算），再把启动失败报出来。
+    shared::dialog::install_panic_reporter(log.clone(), "AICRM 安装程序");
+    if let Err(error) = run() {
+        shared::dialog::report_failure(
+            &log,
+            "AICRM 安装程序启动失败",
+            &format!(
+                "{error}\n\n程序没能创建安装窗口。请把这条信息连同日志一起发给技术支持。"
+            ),
+        );
+    }
+}
+
+/// 安装器自己的错误日志（与客户端同一个目录，客户发日志时只需一个位置）。
+fn setup_error_log() -> PathBuf {
+    shared::paths::install_dir().join("install.err.log")
+}
+
+fn run() -> eframe::Result {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    // 打包时预填的云端地址；`--endpoint` 可覆盖（联调用）。
+    // 先算出来：下面几条无界面路径都要用它。
+    let endpoint = arguments
+        .windows(2)
+        .find(|pair| pair[0] == "--endpoint")
+        .map(|pair| pair[1].clone())
+        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_owned());
 
     // 自检用：只把内嵌载荷解出来，不安装。
     if let Some(position) = arguments.iter().position(|item| item == "--extract-only") {
@@ -64,18 +92,26 @@ fn main() -> eframe::Result {
         std::process::exit(0);
     }
 
+    // 无界面环境检查：界面本身可能就是坏掉的那一个（这是实测最可能的"双击没反应"
+    // 原因），所以「环境准备」必须有一条不依赖 GUI 的路径 —— 结论写日志 + 弹原生提示。
+    if arguments.iter().any(|item| item == "--check") {
+        run_check_only(&endpoint);
+    }
+
     // 与主界面共用一把锁：安装器和客户端不许并排出现。已经有一个界面在跑就
     // 把它叫到前台，自己退出。
     if !single::acquire() {
         single::activate_existing();
+        // 必须**明说**，不能静默退出：装了客户端并让它常驻的机器上，双击安装程序
+        // 走的就是这条路，以前看起来就是"双击没反应"（实测被客户投诉过）。
+        shared::dialog::report_failure(
+            &setup_error_log(),
+            "AICRM 安装程序没有启动",
+            "检测到本机已有 AICRM 正在运行，已为你把它切换到前台。\n\n\
+             要安装或重装：请先从托盘菜单「退出」AICRM，再运行本安装程序。",
+        );
         return Ok(());
     }
-
-    let endpoint = arguments
-        .windows(2)
-        .find(|pair| pair[0] == "--endpoint")
-        .map(|pair| pair[1].clone())
-        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_owned());
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -176,8 +212,28 @@ fn unpack_payload_to(dir: &Path) -> Result<usize, String> {
 /// 解到本次安装专属的临时目录，装完即删。
 fn unpack_payload() -> Result<PathBuf, String> {
     let dir = std::env::temp_dir().join(format!("aicrm-install-{}", std::process::id()));
+    remove_stale_payload_dirs(&dir);
     unpack_payload_to(&dir)?;
     Ok(dir)
+}
+
+/// 清掉以前残留的载荷目录。
+///
+/// 安装器中途被杀（或客户直接关机）会留下近百兆的临时文件 —— 客户机的临时目录
+/// 不该替我们攒垃圾。只动自己命名的那一类目录，别人的东西一概不碰。
+fn remove_stale_payload_dirs(current: &Path) {
+    let Some(parent) = current.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with("aicrm-install-") && entry.path() != current {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// 装完把自己删掉。
@@ -204,48 +260,104 @@ fn remove_self_after_exit() {
     let _ = command.spawn();
 }
 
-/// 调用载荷里的 install.ps1 完成落盘、注册自启与启动服务。
+/// 调用载荷里的 install.ps1 —— 装盘、注册自启、启动服务；`-CheckOnly` 时只做检查。
 ///
-/// 复用安装脚本而不是在 Rust 里重写一遍：拷贝文件、icacls 收紧权限、写 HKCU Run
-/// 这些逻辑已经在那边验证过了，重复实现只会多一处会走样的地方。
-///
-/// 安装是**静默**的：不问账号密码，设备身份留给客户端首次「连接云端」时
-/// 由主控台申领并签发（install.ps1 会先落一个占位 id）。
-fn run_installer(base_url: &str, work: &Path) -> Result<String, String> {
-    let script = work.join("install.ps1");
-    if !script.is_file() {
-        return Err("安装载荷里缺少 install.ps1".to_owned());
-    }
+/// 复用安装脚本而不是在 Rust 里重写一遍：拷贝文件、icacls 收紧权限、写 HKCU Run、
+/// 环境检查，这些逻辑已经在那边验证过了，重复实现只会多一处会走样的地方。
+/// 返回 (输出, 是否成功)：检查模式退出码 1 表示"有必须项没过"，那是结论不是故障，
+/// 所以由调用方决定怎么解读。
+fn run_script(script: &Path, base_url: &str, check_only: bool) -> Result<(String, bool), String> {
     let base = base_url.trim_end_matches('/');
-
     let mut command = Command::new("powershell");
     command
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-        .arg(&script)
+        .arg(script)
         .arg("-CloudUrl")
         .arg(base)
         // 网页来源白名单：云端网页和接口是同一个基地址，所以直接用它。
         // 不带这一项的话，装完网页端拿不到本机令牌，「数据采集」按钮点不动。
         .arg("-AllowOrigin")
         .arg(base);
+    if check_only {
+        command.arg("-CheckOnly");
+    }
 
     let output = command
         .output()
         .map_err(|error| format!("无法运行安装脚本：{error}"))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "安装脚本失败：{}",
-            if stderr.trim().is_empty() {
-                stdout.trim()
-            } else {
-                stderr.trim()
-            }
-        ));
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.trim().is_empty() {
+        text.push('\n');
+        text.push_str(stderr.trim());
     }
-    Ok(stdout.trim().to_owned())
+    Ok((text, output.status.success()))
+}
+
+/// 环境准备：解出载荷 → 跑 `install.ps1 -CheckOnly`。返回（载荷目录，原始输出）。
+///
+/// 载荷目录要留着 —— 检查通过后紧接着就用它安装，没必要解第二遍。
+fn check_environment(endpoint: &str) -> Result<(PathBuf, String), String> {
+    let work = match unpack_payload() {
+        Ok(dir) => dir,
+        Err(_) => std::env::current_exe()
+            .map_err(|error| format!("取不到自身路径：{error}"))?
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "安装包路径异常".to_owned())?,
+    };
+    let script = work.join("install.ps1");
+    if !script.is_file() {
+        return Err(
+            "安装包里缺少 install.ps1 —— 请使用打包后的单文件安装程序（aicrm-pack 产物）"
+                .to_owned(),
+        );
+    }
+    let (output, _) = run_script(&script, endpoint, true)?;
+    Ok((work, output))
+}
+
+/// `--check`：无界面环境检查。结论写日志 + 弹原生提示，退出码 0 通过 / 1 未通过 / 2 出错。
+fn run_check_only(endpoint: &str) -> ! {
+    let log = setup_error_log();
+    let (work, output) = match check_environment(endpoint) {
+        Ok(value) => value,
+        Err(message) => {
+            shared::dialog::report_failure(&log, "AICRM 环境检查没能完成", &message);
+            std::process::exit(2);
+        }
+    };
+    // 只做检查，解出来的载荷用完就删（不占客户机的临时目录）。
+    let _ = std::fs::remove_dir_all(&work);
+    let items = shared::preflight::parse(&output);
+    if items.is_empty() {
+        shared::dialog::report_failure(
+            &log,
+            "AICRM 环境检查没有返回结果",
+            &format!("请把下面的内容发给技术支持：\n\n{}", output.trim()),
+        );
+        std::process::exit(2);
+    }
+    // 明细进日志，弹窗只放结论 —— 弹窗太长反而没人看。
+    shared::dialog::write_failure(&log, "AICRM 环境检查明细", &shared::preflight::diagnostic(&items));
+    let blocking = shared::preflight::blockers(&items);
+    let summary = if blocking.is_empty() {
+        shared::preflight::headline(&items)
+    } else {
+        let lines: Vec<String> = blocking
+            .iter()
+            .map(|item| format!("· {}：{}", item.title, item.detail))
+            .collect();
+        format!(
+            "{}\n\n{}\n\n详细结果：{}",
+            shared::preflight::headline(&items),
+            lines.join("\n"),
+            log.display()
+        )
+    };
+    shared::dialog::report_failure(&log, "AICRM 环境检查", &summary);
+    std::process::exit(if blocking.is_empty() { 0 } else { 1 });
 }
 
 /// 打开客户端。
@@ -293,9 +405,18 @@ struct SetupApp {
     /// 打包时预填的云端地址。不再由用户输入 —— 客户装个软件不该被问这个。
     endpoint: String,
     state: State,
+    /// 环境准备结果。None = 还没检查过；有结果才允许点「开始安装」。
+    checks: Option<Vec<shared::preflight::CheckItem>>,
+    /// 环境准备进行中（解载荷 + 跑检查，几秒到十几秒）。
+    checking: bool,
+    check_pending: Option<Receiver<Result<(PathBuf, Vec<shared::preflight::CheckItem>), String>>>,
+    /// 已经解出来的载荷目录：检查通过后直接用这一份安装，不解第二遍。
+    work: Option<PathBuf>,
     pending: Option<Receiver<Result<String, String>>>,
     /// 「打开客户端」的结果，失败时直接说清楚原因，别让用户猜。
     hint: Option<String>,
+    /// 「复制诊断」的反馈。
+    copied: bool,
 }
 
 impl SetupApp {
@@ -303,8 +424,13 @@ impl SetupApp {
         Self {
             endpoint,
             state: State::Idle,
+            checks: None,
+            checking: false,
+            check_pending: None,
+            work: None,
             pending: None,
             hint: None,
+            copied: false,
         }
     }
 
@@ -325,10 +451,169 @@ impl SetupApp {
 
     /// 静默安装：不问账号密码。
     ///
-    /// 装的是什么（放文件 + 注册自启）和"我是谁"（设备配对）是两件事。以前揉在
-    /// 一个表单里，客户装个软件还得先要账号密码 —— 现在只做前者，配对交给客户端
+    /// 装的是什么（放文件 + 注册自启）和"我是谁"（登录哪个账号）是两件事。以前揉在
+    /// 一个表单里，客户装个软件还得先要账号密码 —— 现在只做前者，登录交给客户端
     /// 首次打开时的「连接云端」引导页。
-    fn start(&mut self, ctx: &egui::Context) {
+    /// 环境准备：解载荷 + 跑检查。**先确认这台机器跑得起来，再让用户点安装** ——
+    /// 装完才发现缺运行库 / 空间不够，比当场说清楚难查得多。
+    fn begin_check(&mut self, ctx: &egui::Context) {
+        if self.checking {
+            return;
+        }
+        let endpoint = self.endpoint.clone();
+        let (sender, receiver) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let outcome = check_environment(&endpoint).and_then(|(work, output)| {
+                let items = shared::preflight::parse(&output);
+                if items.is_empty() {
+                    return Err(format!(
+                        "环境检查没有返回结果，请把下面的内容发给技术支持：\n\n{}",
+                        output.trim()
+                    ));
+                }
+                Ok((work, items))
+            });
+            let _ = sender.send(outcome);
+            ctx.request_repaint();
+        });
+        self.check_pending = Some(receiver);
+        self.checking = true;
+        self.copied = false;
+    }
+
+    fn poll_check(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = &self.check_pending else {
+            return;
+        };
+        let outcome = match receiver.try_recv() {
+            Ok(outcome) => outcome,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err("环境检查线程异常退出".to_owned()),
+        };
+        self.check_pending = None;
+        self.checking = false;
+        match outcome {
+            Ok((work, items)) => {
+                // 明细一并落日志：客户机上的问题，事后只看这一份文件就能定位。
+                shared::dialog::write_failure(
+                    &setup_error_log(),
+                    "AICRM 环境准备",
+                    &shared::preflight::diagnostic(&items),
+                );
+                self.work = Some(work);
+                self.checks = Some(items);
+            }
+            Err(message) => {
+                self.state = State::Failed(message);
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    /// 必须项里没通过的 —— 非空就不放行安装。
+    fn blocked(&self) -> Vec<shared::preflight::CheckItem> {
+        self.checks
+            .as_ref()
+            .map(|items| {
+                shared::preflight::blockers(items)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 环境准备清单。放不下就滚动 —— 宁可滚动，也不要把中文字挤成竖排。
+    fn environment_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(items) = self.checks.clone() else {
+            return;
+        };
+        let blocking = self.blocked();
+
+        ui.horizontal(|ui| {
+            if blocking.is_empty() {
+                theme::pill(ui, theme::OK, "检查通过");
+            } else {
+                theme::pill(ui, theme::BAD, "需要处理");
+            }
+            ui.label(theme::muted(&shared::preflight::headline(&items)));
+        });
+        ui.add_space(10.0);
+
+        egui::ScrollArea::vertical()
+            .max_height(226.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                for item in &items {
+                    let (color, label) = if item.passed {
+                        (theme::OK, "通过")
+                    } else if item.required {
+                        (theme::BAD, "未通过")
+                    } else {
+                        (theme::WARN, "提醒")
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("●").size(11.0).color(color));
+                        ui.label(egui::RichText::new(&item.title).size(13.0).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(egui::RichText::new(label).size(12.0).color(color));
+                        });
+                    });
+                    ui.add(egui::Label::new(theme::faint(&item.detail)).wrap());
+                    ui.add_space(7.0);
+                }
+            });
+        ui.add_space(12.0);
+
+        if !blocking.is_empty() {
+            ui.label(theme::muted(
+                "先解决上面标「未通过」的必须项，再点「重新检测」。",
+            ));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if theme::primary_button(ui, "重新检测").clicked() {
+                    let ctx = ui.ctx().clone();
+                    self.checks = None;
+                    self.begin_check(&ctx);
+                }
+                if theme::ghost_button(ui, "复制诊断").clicked() {
+                    ui.ctx().copy_text(shared::preflight::diagnostic(&items));
+                    self.copied = true;
+                }
+                if theme::ghost_button(ui, "关闭").clicked() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+            if self.copied {
+                ui.add_space(6.0);
+                ui.label(theme::faint("诊断信息已复制，可以粘贴给技术支持。"));
+            }
+            if let Some(first) = blocking.first() {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!("{}：{}", first.title, first.detail))
+                        .size(12.0)
+                        .color(theme::BAD),
+                );
+            }
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            if theme::primary_button(ui, "开始安装").clicked() {
+                let ctx = ui.ctx().clone();
+                self.start_install(&ctx);
+            }
+            if theme::ghost_button(ui, "重新检测").clicked() {
+                let ctx = ui.ctx().clone();
+                self.checks = None;
+                self.begin_check(&ctx);
+            }
+        });
+    }
+
+    fn start_install(&mut self, ctx: &egui::Context) {
         if self.busy() {
             return;
         }
@@ -338,6 +623,8 @@ impl SetupApp {
             return;
         }
 
+        // 环境准备已经解过载荷，直接用那一份（没有就现解）。
+        let prepared = self.work.clone();
         let (sender, receiver) = mpsc::channel();
         let ctx = ctx.clone();
 
@@ -345,19 +632,28 @@ impl SetupApp {
             let outcome = (|| -> Result<String, String> {
                 // 取出随包的程序与脚本：优先用内嵌载荷（单文件安装程序），
                 // 没有载荷就退回"和本 exe 同目录"的旧布局（开发机手工分发用）。
-                let work = match unpack_payload() {
-                    Ok(dir) => dir,
-                    Err(_) => std::env::current_exe()
-                        .map_err(|error| format!("取不到自身路径：{error}"))?
-                        .parent()
-                        .map(Path::to_path_buf)
-                        .ok_or_else(|| "安装包路径异常".to_owned())?,
+                let work = match prepared {
+                    Some(dir) => dir,
+                    None => unpack_payload().or_else(|_| {
+                        std::env::current_exe()
+                            .map_err(|error| format!("取不到自身路径：{error}"))?
+                            .parent()
+                            .map(Path::to_path_buf)
+                            .ok_or_else(|| "安装包路径异常".to_owned())
+                    })?,
                 };
-                let log = run_installer(&base, &work)?;
+                let script = work.join("install.ps1");
+                if !script.is_file() {
+                    return Err("安装包里缺少 install.ps1".to_owned());
+                }
+                let (log, ok) = run_script(&script, &base, false)?;
+                if !ok {
+                    return Err(format!("安装脚本失败：\n{}", log.trim()));
+                }
                 let _ = std::fs::remove_dir_all(&work);
                 Ok(format!(
-                    "{log}\n\n下一步：客户端打开后会请你连一次云端，\
-                     连上就完成配对，以后不用再填。"
+                    "{log}\n\n下一步：客户端打开后会用云端账号登录一次，\
+                     以后打开就直接进主界面。"
                 ))
             })();
             let _ = sender.send(outcome);
@@ -441,14 +737,18 @@ impl SetupApp {
 
 impl eframe::App for SetupApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 不问任何东西，打开就开始装。安装器已经没有需要用户填的内容了。
-        if matches!(self.state, State::Idle) {
-            self.start(ctx);
+        // 打开先做环境准备：检查通过之前，安装按钮是禁着的。
+        // 不问任何东西 —— 安装器已经没有需要用户填的内容了。
+        if matches!(self.state, State::Idle) && self.checks.is_none() {
+            self.begin_check(ctx);
         }
+        self.poll_check(ctx);
         let before = std::mem::discriminant(&self.state);
         self.poll(ctx);
         // 与主控台同理：状态变了必须再要一帧，否则界面不刷新
-        if matches!(self.state, State::Working(_)) || std::mem::discriminant(&self.state) != before
+        if self.checking
+            || matches!(self.state, State::Working(_))
+            || std::mem::discriminant(&self.state) != before
         {
             ctx.request_repaint();
         }
@@ -460,12 +760,30 @@ impl eframe::App for SetupApp {
             ui.add_space(4.0);
             ui.label(egui::RichText::new("AICRM 安装").size(17.0).strong());
             ui.add_space(4.0);
-            ui.label(theme::muted(
-                "正在安装，完成后会自动打开客户端。不需要填任何东西。",
-            ));
-            ui.add_space(24.0);
+            ui.label(theme::muted(match &self.state {
+                State::Idle if self.checking => "正在准备运行环境…",
+                State::Idle => "先确认运行环境没问题，再开始安装。",
+                State::Working(_) => "正在安装，完成后会自动打开客户端。",
+                State::Done(_) => "安装完成。",
+                State::Failed(_) => "没能完成，原因写在下面。",
+            }));
+            ui.add_space(18.0);
 
-            self.status_ui(ui);
+            if self.checking && self.checks.is_none() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new(
+                            "正在检查：系统版本 / 磁盘空间 / 目录权限 / 运行库 / 云端连通性…",
+                        )
+                        .size(13.0),
+                    );
+                });
+            } else if matches!(self.state, State::Idle) {
+                self.environment_ui(ui);
+            } else {
+                self.status_ui(ui);
+            }
 
             if let Some(hint) = &self.hint {
                 ui.add_space(8.0);
@@ -475,12 +793,13 @@ impl eframe::App for SetupApp {
             // 只有失败才给按钮。成功路径上不该出现需要用户点的东西 ——
             // 装完会自动拉起客户端并关掉自己。
             if matches!(self.state, State::Failed(_)) {
-                ui.add_space(20.0);
+                ui.add_space(16.0);
                 ui.horizontal(|ui| {
-                    if theme::primary_button(ui, "重试").clicked() {
+                    if theme::primary_button(ui, "重新检测").clicked() {
                         let ctx = ui.ctx().clone();
                         self.state = State::Idle;
-                        self.start(&ctx);
+                        self.checks = None;
+                        self.begin_check(&ctx);
                     }
                     if theme::ghost_button(ui, "关闭").clicked() {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);

@@ -11,11 +11,12 @@
 //! POST <endpoint>
 //! Content-Type: application/json
 //!
-//! {"username":"admin","password":"……","device_id":"3f2a…","client_version":"0.1.0"}
+//! {"username":"admin","password":"……","client_id":"3f2a…","client_version":"0.1.0"}
 //! ```
 //!
 //! 云端目前只读 `username` / `password`；其余字段被忽略（`platformweb.DecodeJSON` 解到
-//! map，不拒绝未知字段），`device_id` 是为后续设备绑定预留的。
+//! map，不拒绝未知字段）。`client_id` 是本机客户端实例标识 —— 云端不认设备，
+//! 它只用来落实「一个账号只能登录一个客户端」。
 //!
 //! **不带 `Authorization` 头。** 这个端点就是"用凭据换令牌"的入口，它自己不可能要求令牌
 //! （鸡生蛋）。代价是它天然是公开端点，只能靠 **HTTPS + 云端失败次数限制** 防滥用。
@@ -41,7 +42,7 @@ use std::time::Duration;
 struct LoginRequest<'a> {
     username: &'a str,
     password: &'a str,
-    device_id: &'a str,
+    client_id: &'a str,
     client_version: &'a str,
 }
 
@@ -130,12 +131,12 @@ pub fn login(
     endpoint: &str,
     username: &str,
     password: &str,
-    device_id: &str,
+    client_id: &str,
 ) -> Result<Session, LoginError> {
     let body = serde_json::to_string(&LoginRequest {
         username,
         password,
-        device_id,
+        client_id,
         client_version: env!("CARGO_PKG_VERSION"),
     })
     .map_err(|error| LoginError::Protocol(format!("请求序列化失败：{error}")))?;
@@ -206,53 +207,6 @@ pub fn transport_warning(endpoint: &str) -> Option<String> {
     Some("警告：该地址不是 HTTPS，密码会以明文经过网络".to_owned())
 }
 
-/// 云端签发的设备预置授权：设备 ID 与配对码成对出现。
-#[derive(Deserialize)]
-pub struct Provision {
-    #[serde(rename = "deviceId")]
-    pub device_id: String,
-    #[serde(rename = "provisionCode")]
-    pub provision_code: String,
-}
-
-/// 用已登录的令牌为本机申领一个配对码。
-///
-/// 该接口要求管理员权限 —— 这正是过去"装个客户端还得先要账号密码"的根因。
-/// 现在配对挪到客户端首次打开时的连接引导页，由使用者填一次，装的时候一个字都不问。
-pub fn create_provision(base_url: &str, access_token: &str) -> Result<Provision, String> {
-    let url = format!("{}/api/ui/v1/provisions", base_url.trim_end_matches('/'));
-    let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows".to_owned());
-    let body = serde_json::json!({ "name": name }).to_string();
-
-    let agent: ureq::Agent = ureq::config::Config::builder()
-        .timeout_global(Some(Duration::from_secs(30)))
-        .http_status_as_error(false)
-        .build()
-        .into();
-    let mut response = agent
-        .post(&url)
-        .header("Authorization", &format!("Bearer {access_token}"))
-        .header("Content-Type", "application/json")
-        .send(body.as_str())
-        .map_err(|error| format!("无法连接云端：{error}"))?;
-
-    let status = response.status();
-    let text = response
-        .body_mut()
-        .read_to_string()
-        .map_err(|error| format!("读取响应失败：{error}"))?;
-    if !status.is_success() {
-        return Err(format!(
-            "云端拒绝签发配对码（HTTP {status}）。这个账号需要有管理员权限：{text}"
-        ));
-    }
-    let envelope: Envelope<Provision> =
-        serde_json::from_str(&text).map_err(|_| "云端返回格式不符合预期".to_owned())?;
-    envelope
-        .data
-        .ok_or_else(|| "云端没有返回配对信息".to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,7 +273,7 @@ mod tests {
                     {"name":"admin","display_name":"管理员"}]}}}"#,
         );
 
-        let session = login(&endpoint, "zhangsan", "hunter2", "device-1").unwrap();
+        let session = login(&endpoint, "zhangsan", "hunter2", "client-1").unwrap();
 
         assert_eq!(session.access_token, "eyJhbGciOi.access");
         assert_eq!(session.refresh_token.as_deref(), Some("eyJhbGciOi.refresh"));
@@ -345,7 +299,7 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(payload["username"], "zhangsan");
         assert_eq!(payload["password"], "hunter2");
-        assert_eq!(payload["device_id"], "device-1");
+        assert_eq!(payload["client_id"], "client-1");
         assert!(payload["client_version"].is_string());
     }
 
@@ -355,7 +309,7 @@ mod tests {
             "200 OK",
             r#"{"code":0,"message":"success","data":{"accessToken":"tok","user":{"user":{"username":"admin"}}}}"#,
         );
-        let session = login(&endpoint, "admin", "x", "device-1").unwrap();
+        let session = login(&endpoint, "admin", "x", "client-1").unwrap();
         assert_eq!(session.display_name.as_deref(), Some("admin"));
         assert!(session.refresh_token.is_none());
     }
@@ -368,7 +322,7 @@ mod tests {
             r#"{"code":401,"message":"账号或密码错误","data":null}"#,
         );
 
-        let error = login(&endpoint, "zhangsan", "wrong", "device-1").unwrap_err();
+        let error = login(&endpoint, "zhangsan", "wrong", "client-1").unwrap_err();
         assert!(matches!(error, LoginError::Rejected(_)), "{error:?}");
         assert_eq!(error.message(), "账号或密码错误");
     }
@@ -376,7 +330,7 @@ mod tests {
     #[test]
     fn success_envelope_without_data_is_a_protocol_error() {
         let (endpoint, _) = mock_cloud("200 OK", r#"{"code":0,"message":"success","data":null}"#);
-        let error = login(&endpoint, "admin", "x", "device-1").unwrap_err();
+        let error = login(&endpoint, "admin", "x", "client-1").unwrap_err();
         assert!(matches!(error, LoginError::Protocol(_)), "{error:?}");
     }
 
@@ -384,7 +338,7 @@ mod tests {
     fn server_fault_is_retryable_not_a_credential_problem() {
         let (endpoint, _) = mock_cloud("500 Internal Server Error", r#"{"message":"boom"}"#);
 
-        let error = login(&endpoint, "zhangsan", "hunter2", "device-1").unwrap_err();
+        let error = login(&endpoint, "zhangsan", "hunter2", "client-1").unwrap_err();
         assert!(matches!(error, LoginError::Unreachable(_)), "{error:?}");
     }
 
@@ -392,7 +346,7 @@ mod tests {
     fn non_contract_response_is_reported_as_protocol_error() {
         let (endpoint, _) = mock_cloud("200 OK", r#"{"unexpected":true}"#);
 
-        let error = login(&endpoint, "zhangsan", "hunter2", "device-1").unwrap_err();
+        let error = login(&endpoint, "zhangsan", "hunter2", "client-1").unwrap_err();
         assert!(matches!(error, LoginError::Protocol(_)), "{error:?}");
     }
 

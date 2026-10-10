@@ -32,14 +32,13 @@ pub fn cloud_url() -> PathBuf {
     install_dir().join("cloud.url")
 }
 
-/// 设备标识。云端用它单独撤销某一台设备。
-pub fn device_id() -> PathBuf {
-    install_dir().join("device.id")
-}
-
-/// 设备令牌（配对时由云端确认，本机只存明文一份，权限已收紧）。
-pub fn device_token() -> PathBuf {
-    install_dir().join("device.token")
+/// 客户端实例标识（本机生成的 UUID）。
+///
+/// 没有"设备身份"这回事：云端只认登录账号。这个标识唯一的用途是落实
+/// 「一个账号只能登录一个客户端」—— 同一账号在多台电脑上登录时，云端靠它分辨
+/// 是谁，并把先登录的那台请下线。它不是凭据，不需要签发，也不参与任何鉴权。
+pub fn client_id() -> PathBuf {
+    install_dir().join("client.id")
 }
 
 /// 登录账号名（登录成功后写入，主界面右上角读取）。

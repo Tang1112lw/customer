@@ -36,7 +36,7 @@ mod font;
 
 use shared::{
     cache::decrypted_cache_ready,
-    device,
+    credentials,
     paths::{self, install_dir},
     process,
     self_name::self_name_from_exports,
@@ -59,7 +59,26 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// 状态自动刷新间隔：只读本地文件，开销可以忽略。
 const REFRESH: Duration = Duration::from_secs(5);
 
-fn main() -> eframe::Result {
+fn main() {
+    let log = console_error_log();
+    // 界面是 GUI：出错时没有控制台可看，静默退出就是"双击没反应"。
+    // 先装兜底（panic 也算），再把启动失败报出来。
+    shared::dialog::install_panic_reporter(log.clone(), "AICRM 客户端");
+    if let Err(error) = run() {
+        shared::dialog::report_failure(
+            &log,
+            "AICRM 客户端启动失败",
+            &format!("{error}\n\n请把这条信息连同日志一起发给技术支持。"),
+        );
+    }
+}
+
+/// 界面程序自己的错误日志。放在安装目录里，客户发日志时只需一个位置。
+fn console_error_log() -> std::path::PathBuf {
+    install_dir().join("console.err.log")
+}
+
+fn run() -> eframe::Result {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
 
     // 托盘「启动服务」走这条：起完就退，不弹窗口。
@@ -79,6 +98,12 @@ fn main() -> eframe::Result {
     // 也不许并排开第二个窗口（主界面与安装器共用同一把锁，所以也不会同时出现）。
     if !single::acquire() {
         single::activate_existing();
+        // 留痕：重复双击图标走这条路（正常行为，但出事时要能从日志看出来）。
+        shared::dialog::write_failure(
+            &console_error_log(),
+            "AICRM 客户端未启动",
+            "本机已有客户端在运行，已把它叫到前台",
+        );
         return Ok(());
     }
 
@@ -105,8 +130,8 @@ fn main() -> eframe::Result {
 }
 
 /// 启动后台服务的命令。**不带任何参数** —— 服务默认从自己所在目录读
-/// tools/accounts/data/凭据文件，云端三项（cloud.url / device.token / device.id）
-/// 也现读现用。参数拼装与"改一处漏一处"的自启项同步在这里整体消失。
+/// tools/accounts/data/凭据文件，云端地址（cloud.url）与登录令牌也现读现用。
+/// 参数拼装与"改一处漏一处"的自启项同步在这里整体消失。
 fn service_command() -> Command {
     let mut command = Command::new(install_dir().join("aicrm_windows_api.exe"));
     command.creation_flags(CREATE_NO_WINDOW);
@@ -123,21 +148,15 @@ fn read_trimmed(path: &Path) -> String {
 ///
 /// 没有用互斥量：托盘每次点击都会拉起一次程序，开出一串窗口是必然的事故，
 /// 这个检查足够挡住，而且不引入额外的依赖。
-/// 连接云端：登录 → 令牌落盘 →（未配对时）申领配对码并交给安装脚本。
+/// 登录云端：换取会话令牌并写进本地。
 ///
-/// 首次配对与「重新登录」走同一条路：先把会话令牌写进本地 —— 心跳把它作为
-/// `X-AICRM-User-Token` 上送，云端据此决定"哪个账号的网页端看得见这台客户端"。
-/// 已配对的机器到这里就结束了（只换令牌）；没配对的再申领配对码，
-/// 由安装脚本完成设备身份落盘与自启项注册。
-///
-/// 配对复用安装脚本而不是在 Rust 里重写：令牌生成（`New-HexToken`）、
-/// 收紧文件权限、重启服务 —— 这些都在那边验证过了。
+/// **只有这一步，没有配对。** 2026-10-10 取消设备绑定后，客户端与云端的关系就是
+/// 一句「这个账号在我这里登录着」：令牌落盘 → 服务带它心跳 → 同一账号的网页端
+/// 立刻看得见这台客户端，并能绑微信、点采集。首次使用与「重新登录」走同一条路。
 fn connect_task(base: &str, username: &str, password: &str) -> Result<String, String> {
-    // 登录请求里的 device_id：已有就带真的，没有就用占位值。
-    // **不能在这里生成 device.id 文件**：设备身份由配对流程签发 —— install.ps1 只在
-    // 文件缺失时才会写入预置码配套的 `-DeviceId`，先落一个随机值会让它被当成
-    // "已有身份"沿用，配对可能拿错身份。
-    let device_arg = std::fs::read_to_string(paths::device_id())
+    // 客户端实例标识随登录上送：同一个账号在多台电脑登录时，云端靠它分辨是谁，
+    // 并把先登录的那台请下线（一个账号只能登录一个客户端）。
+    let client_id = std::fs::read_to_string(paths::client_id())
         .ok()
         .map(|text| text.trim().to_owned())
         .filter(|text| !text.is_empty())
@@ -146,82 +165,45 @@ fn connect_task(base: &str, username: &str, password: &str) -> Result<String, St
         &format!("{base}/api/auth/login"),
         username,
         password,
-        &device_arg,
+        &client_id,
     )
     .map_err(|error| error.message().to_owned())?;
 
-    // 令牌先落盘，再谈配对：这条路对"已配对机器重新登录"同样成立。
     if let Some(name) = session.display_name.as_deref() {
-        let _ = device::save_account(&paths::account_name(), name);
+        let _ = credentials::save_account(&paths::account_name(), name);
     }
-    let warning = match device::save_token(&paths::api_token(), &session.access_token) {
+    let warning = match credentials::save_token(&paths::api_token(), &session.access_token) {
         Ok(notice) => notice,
         Err(error) => return Err(format!("令牌写入失败：{error}")),
     };
     // 刷新令牌一并落盘：access token 只有 2 小时，服务靠它自动续期。
     if let Some(refresh) = session.refresh_token.as_deref() {
-        let _ = device::save_token(&paths::api_refresh(), refresh);
+        let _ = credentials::save_token(&paths::api_refresh(), refresh);
     }
 
     let who = session
         .display_name
         .unwrap_or_else(|| username.to_owned());
 
-    if paired() {
-        // 已配对：换令牌就是全部工作。服务启动时读一次令牌，重启才换得掉。
-        if service_up() {
-            process::stop_service();
-        }
-        let mut message = format!("已登录：{who}。服务将用新令牌重启");
-        if let Some(notice) = warning {
-            message.push_str(&format!("（{notice}）"));
-        }
-        return Ok(message);
+    // 服务启动时读一次令牌，重启才换得掉。
+    if service_up() {
+        process::stop_service();
     }
-
-    let provision = cloud::create_provision(base, &session.access_token)?;
-
-    let script = install_dir().join("install.ps1");
-    if !script.is_file() {
-        return Err("找不到安装脚本，无法完成配对。请重新运行安装程序。".to_owned());
+    let mut message = format!("已登录：{who}。服务将用新令牌重启");
+    if let Some(notice) = warning {
+        message.push_str(&format!("（{notice}）"));
     }
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-        .arg(&script)
-        .arg("-CloudUrl")
-        .arg(base)
-        .arg("-DeviceId")
-        .arg(&provision.device_id)
-        .arg("-ProvisionCode")
-        .arg(&provision.provision_code)
-        .arg("-AllowOrigin")
-        .arg(base)
-        // 别让脚本把调用它的我们停掉（脚本默认会停 console 以便覆盖文件）。
-        .arg("-KeepConsole")
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|error| format!("无法运行安装脚本：{error}"))?;
-
-    if output.status.success() {
-        Ok(format!(
-            "已连接云端，设备 {}。以后打开直接进主界面。",
-            provision.device_id
-        ))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        Err(if stderr.is_empty() { stdout } else { stderr })
-    }
+    Ok(message)
 }
 
-/// 这台机器是否已经和云端配过对。
+/// 本机是否已经登录云端账号。
 ///
-/// 判据是 `device.token` 在不在 —— 它是设备身份的凭据，没有它服务上报会被云端
-/// 直接拒（401），所以首次打开必须先把它办下来。
-fn paired() -> bool {
-    let path = paths::device_token();
-    std::fs::read_to_string(&path)
-        .map(|text| text.trim().len() >= 32)
+/// 判据是 `api.token` 是不是**还没过期**的云端会话 JWT（登录或续期写入）。
+/// 安装时生成的本地随机令牌不算登录；过期的令牌也不算 —— 它连不上云端，
+/// 只判"看起来像令牌"会让界面一直显示已登录、用户却什么都点不动。
+fn logged_in() -> bool {
+    std::fs::read_to_string(paths::api_token())
+        .map(|text| shared::session::token_is_live(&text))
         .unwrap_or(false)
 }
 
@@ -306,7 +288,8 @@ struct Snapshot {
     credential_ready: bool,
     /// 微信号（昵称），从导出的 messages.json 里找；找不到回落显示 wxid
     wechat_name: Option<String>,
-    cloud: Option<(String, String)>,
+    /// 云端地址（`cloud.url` 的内容）。None = 还没配置。
+    cloud: Option<String>,
     jobs: Vec<Job>,
     /// 已登录的账号名，来自 `account.name`（登录流程写入）。None = 未登录。
     account: Option<String>,
@@ -324,11 +307,11 @@ enum Page {
     #[default]
     Main,
     Config,
-    /// 首次打开、还没和云端配对过时的引导页。配对完成后就不再出现。
+    /// 首次打开、还没登录过账号时的引导页（登录成功后就不再出现）。
     Connect,
 }
 
-/// 连接引导页的状态。配对是网络操作，必须放后台线程，否则界面会卡死。
+/// 登录引导页的状态。登录是网络操作，必须放后台线程，否则界面会卡死。
 struct Connect {
     username: String,
     password: String,
@@ -453,9 +436,8 @@ fn snapshot() -> Snapshot {
     }
 
     let url = read_trimmed(&paths::cloud_url());
-    let device = read_trimmed(&paths::device_id());
-    if !url.is_empty() && !device.is_empty() {
-        snap.cloud = Some((url, device));
+    if !url.is_empty() {
+        snap.cloud = Some(url);
     }
 
     let jobs_root = dir.join("data").join("jobs");
@@ -512,7 +494,7 @@ struct Console {
     page: Page,
     /// 右上角账号菜单是否展开
     account_menu: bool,
-    /// 连接引导页的表单与后台任务。只在未配对时用得到。
+    /// 登录引导页的表单与后台任务。只在未登录时用得到。
     connect: Connect,
 }
 
@@ -531,9 +513,9 @@ impl Console {
             visible,
             // 默认托管：打开窗口就等于"服务该在跑"，掉了自动拉回来。
             auto_service: true,
-            // 没配对过就先引导连接：设备身份是与云端通信的前提，
-            // 少了它服务起来也只会一直 401。
-            page: if paired() { Page::Main } else { Page::Connect },
+            // 没登录过就先引导登录：登录令牌是与云端通信的唯一前提，
+            // 没有它命令通道根本不会启动。
+            page: if logged_in() { Page::Main } else { Page::Connect },
             account_menu: false,
             connect: Connect::default(),
         }
@@ -545,7 +527,7 @@ impl Console {
         self.keep_service_alive();
     }
 
-    /// 开始连接：后台跑登录 → 申领配对码 → 交给安装脚本完成配对。
+    /// 开始登录：后台用账号密码向云端换取会话令牌并落盘。
     fn start_connect(&mut self, ctx: &egui::Context) {
         if self.connect.step.is_some() {
             return;
@@ -593,7 +575,7 @@ impl Console {
     /// 托管本地服务：没在跑就拉起来，跑着就什么都不做。
     ///
     /// 这是每 5 秒一次的常规刷新里顺带做的 —— 服务是采集和心跳的载体，它掉了
-    /// 云端立刻把这台设备标成离线，网页端也就点不动"绑定微信"。以前只能靠用户
+    /// 云端立刻把这个账号的客户端标成离线，网页端也就点不动"绑定微信"。以前只能靠用户
     /// 自己发现状态栏变红再手点启动，等于把可用性押在用户盯着看上。
     fn keep_service_alive(&mut self) {
         if !self.auto_service || self.snap.service_up {
@@ -622,7 +604,8 @@ impl Console {
     /// 退出登录：丢掉云端会话，换一把新的本地接口令牌。
     ///
     /// 不是删掉令牌文件 —— 服务启动时要求令牌至少 32 位可见字符，空文件会让服务
-    /// 起不来；`device.token`（设备身份）更不能动，换了它就得重新配对。
+    /// 起不来。换成本地随机令牌同时有两个效果：命令通道随即停用（未登录），
+    /// 本机接口仍能继续用（令牌非空）。
     fn logout(&mut self) {
         let mut fresh = String::new();
         while fresh.len() < 64 {
@@ -640,6 +623,10 @@ impl Console {
                 if self.snap.service_up {
                     process::stop_service();
                 }
+                // 退回登录页：令牌已经换成本地随机值，命令通道不该再连云端。
+                self.page = Page::Connect;
+                self.connect.error = None;
+                self.connect.password.clear();
                 self.note = Some("已退出登录；启动服务后使用新令牌".to_owned());
             }
             Err(error) => self.note = Some(format!("写入失败：{error}")),
@@ -651,8 +638,8 @@ impl Console {
     ///
     /// 服务每轮心跳都重读 `cloud.url`，所以下一轮（≤20 秒）就用新地址 ——
     /// 不用重启服务、不需要动自启项（它只写 exe 路径，没有地址参数）、
-    /// 也不需要重新配对：设备身份在 `device.id` / `device.token` 里，
-    /// 只要云端还是同一个库，客户端换地址后照样被认出来。
+    /// 也不需要重新登录：账号身份在登录令牌里，只要云端还是同一个库，
+    /// 客户端换地址后照样被认出来。
     fn save_cloud(&mut self) {
         let Some(draft) = self.editing.take() else {
             return;
@@ -959,25 +946,25 @@ impl Console {
         });
     }
 
-    /// 连接引导页：还没和云端配对过时才出现。
+    /// 登录引导页：还没登录过账号时才出现。
     ///
     /// 独立于主界面，不显示侧边栏 —— 这会儿"主界面/配置"都还没有意义，
     /// 连不上什么都是空的。
     fn connect_page(&mut self, ui: &mut egui::Ui) {
-        // 已配对又回到这一页 = 从账号菜单点了「重新登录」；首次打开则是「连接云端」。
-        let paired = paired();
+        // 已登录又回到这一页 = 从账号菜单点了「重新登录」；首次打开则是「连接云端」。
+        let logged = logged_in();
         ui.vertical_centered(|ui| {
             ui.add_space(46.0);
             ui.label(
-                egui::RichText::new(if paired { "登录账号" } else { "连接云端" })
+                egui::RichText::new(if logged { "重新登录" } else { "连接云端" })
                     .size(18.0)
                     .strong(),
             );
             ui.add_space(6.0);
-            ui.label(theme::muted(if paired {
-                "换账号后，这台设备会自动归属到新账号"
+            ui.label(theme::muted(if logged {
+                "换账号后，这台客户端立刻归属到新账号"
             } else {
-                "首次使用：登录一次，完成本机与云端的配对"
+                "首次使用：用云端账号登录一次即可"
             }));
         });
         ui.add_space(26.0);
@@ -1023,7 +1010,7 @@ impl Console {
                             self.connect.step.as_deref().unwrap_or("正在连接…"),
                         ));
                     });
-                } else if theme::primary_button(ui, "连接").clicked() {
+                } else if theme::primary_button(ui, if logged { "重新登录" } else { "连接" }).clicked() {
                     let ctx = ui.ctx().clone();
                     self.start_connect(&ctx);
                 }
@@ -1046,8 +1033,8 @@ impl Console {
 
     /// 配置页。只干一件事：改与云端的连接地址。
     ///
-    /// 设备 ID 是只读展示 —— 它决定云端认不认这台机器，改了就得重新配对，
-    /// 所以只给"复制"，不给编辑。
+    /// 账号与客户端标识都是只读展示：账号决定云端认不认这台客户端，标识只用于
+    /// 云端分辨同一账号的多台电脑，两者都不需要用户编辑。
     fn config_page(&mut self, ui: &mut egui::Ui) {
         ui.label(theme::section("云端连接"));
         ui.add_space(10.0);
@@ -1079,10 +1066,7 @@ impl Console {
                     });
                 }
                 None => {
-                    let current = cloud
-                        .as_ref()
-                        .map(|(url, _)| url.clone())
-                        .unwrap_or_else(|| "未设置".to_owned());
+                    let current = cloud.clone().unwrap_or_else(|| "未设置".to_owned());
                     ui.add(egui::Label::new(theme::value(&current)).truncate());
                     ui.add_space(12.0);
                     theme::divider(ui);
@@ -1099,28 +1083,44 @@ impl Console {
         });
 
         ui.add_space(12.0);
-        ui.label(theme::section("设备"));
+        ui.label(theme::section("账号"));
         ui.add_space(10.0);
-        let device = cloud.as_ref().map(|(_, d)| d.clone()).unwrap_or_default();
+        let account = self
+            .snap
+            .account
+            .clone()
+            .unwrap_or_else(|| "未登录".to_owned());
+        let instance = read_trimmed(&paths::client_id());
+        let mut copied = false;
         theme::card(ui, width, |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(theme::muted("设备 ID"));
-                    ui.add_space(4.0);
-                    if device.is_empty() {
-                        ui.label(theme::value("尚未配对"));
-                    } else {
-                        ui.label(egui::RichText::new(&device).size(13.0));
-                    }
+            ui.label(theme::muted("当前登录账号"));
+            ui.add_space(4.0);
+            ui.add(egui::Label::new(theme::value(&account)).truncate());
+            ui.add_space(12.0);
+            theme::divider(ui);
+            ui.add_space(12.0);
+            ui.label(theme::muted("本机客户端标识"));
+            ui.add_space(4.0);
+            if instance.is_empty() {
+                ui.label(theme::faint("尚未生成（服务首次运行后出现）"));
+            } else {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&instance).size(12.0)).truncate(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::ghost_button(ui, "复制").clicked() {
+                            ui.ctx().copy_text(instance.clone());
+                            copied = true;
+                        }
+                    });
                 });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if !device.is_empty() && theme::ghost_button(ui, "复制").clicked() {
-                        ui.ctx().copy_text(device.clone());
-                        self.note = Some("设备 ID 已复制".to_owned());
-                    }
-                });
-            });
+                ui.label(theme::faint("仅用于云端区分同一账号的多台电脑，排查问题时提供"));
+            }
         });
+        if copied {
+            self.note = Some("客户端标识已复制".to_owned());
+        }
 
         if let Some(draft) = start_edit {
             self.editing = Some(draft);
@@ -1271,7 +1271,7 @@ impl Console {
             theme::card_head_rev(ui, "云端连接", color, status);
             ui.add_space(8.0);
             match &cloud {
-                Some((url, _)) => {
+                Some(url) => {
                     ui.add(egui::Label::new(theme::value(url)).truncate());
                     ui.label(theme::faint(match reachable {
                         Some(true) => "连接正常",

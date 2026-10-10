@@ -36,9 +36,14 @@ const BINARIES: [&str; 3] = [
     "aicrm-console.exe",
     "aicrm-update.exe",
 ];
-const TOOLS: [&str; 3] = [
+// vcruntime140.dll 是**随包附带的 VC++ 运行库**：第三方程序
+// （AICRM-Key.exe / aicrm-export-new.exe）改不了它们的链接方式，只能靠在 exe
+// 同目录放一份运行库（应用本地装配）来兜住"客户机没装 VC++"。
+// 我们自己的程序已经静态链接，不需要它，但一起带上没有坏处。
+const TOOLS: [&str; 4] = [
     "AICRM-Key.exe",
     "aicrm-export-new.exe",
+    "vcruntime140.dll",
     "使用手册.txt",
 ];
 

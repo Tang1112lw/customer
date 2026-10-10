@@ -6,14 +6,8 @@
     [string]$Bind = '127.0.0.1:8765',
 
     # ---- 命令通道（云端控制本机取密钥/导出）----
-    # 云端基地址，例如 https://xxx.trycloudflare.com；给了才启用轮询。
+    # 云端基地址，例如 https://aicrm.example.com；给了才启用命令通道。
     [string]$CloudUrl = '',
-    # 云端网页端签发预置码时一并返回的设备的 ID。
-    # 必须原样使用：云端要求 deviceId 与预置码成对匹配，自己随机生成会被 410 拒绝。
-    [string]$DeviceId = '',
-    # 云端网页端签发的短时预置码。留空表示只装成本地 API，不接云端。
-    [string]$ProvisionCode = '',
-    [string]$DeviceName = $env:COMPUTERNAME,
     # 允许调用本机客户端接口的网页来源（客户的云端域名）。可重复传，或逗号分隔。
     [string]$AllowOrigin = '',
 
@@ -22,10 +16,10 @@
     [string]$ToolSource = '',
     # Markdown 导出程序。默认在 ToolSource 里找；找不到就报错，不静默降级。
     [string]$ExportProgram = '',
-    # 客户端首次「连接云端」时会再调一次本脚本完成配对。那种场景下必须保留
-    # 调用者自己（aicrm-console.exe），否则脚本刚跑就把客户端停掉，
-    # 表现为"点了连接、窗口直接消失"。
-    [switch]$KeepConsole
+
+    # 只做环境准备检查：打印 CHECK 行后退出，不写入任何文件。
+    # 安装器界面用它画「环境准备」清单，人也可以直接跑来看结论。
+    [switch]$CheckOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -52,25 +46,14 @@ function Resolve-Binary([string]$name) {
     throw "找不到 $name（既不在 target\release 也不在脚本同级目录）"
 }
 
-$exeSource     = Resolve-Binary 'aicrm_windows_api.exe'
-$consoleSource = Resolve-Binary 'aicrm-console.exe'
-$exe           = Join-Path $InstallDir 'aicrm_windows_api.exe'
-$consoleExe    = Join-Path $InstallDir 'aicrm-console.exe'
-$tools       = Join-Path $InstallDir 'tools'
-$data        = Join-Path $InstallDir 'data'
-$tokenFile   = Join-Path $InstallDir 'api.token'
-$deviceFile  = Join-Path $InstallDir 'device.id'
-$deviceTokenFile = Join-Path $InstallDir 'device.token'
+# 开机自启项的位置：环境准备要检查它可写，所以先给出来。其余路径放在环境准备**之后**
+# 再算 —— 它们都是 Join-Path 出来的，盘符不存在之类的低级错误会当场抛错，
+# 不该挡在检查前面（检查的作用就是把这些原因说清楚）。
 $runKey      = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 
 if (-not $ToolSource) {
     $inProject = Join-Path $PSScriptRoot 'src\tools'
     $ToolSource = if (Test-Path -LiteralPath $inProject) { $inProject } else { Join-Path $PSScriptRoot 'tools' }
-}
-# 密钥目录允许不存在：新机器上密钥还没采集，AICRM-Key.exe 会往里写。
-if (-not (Test-Path -LiteralPath $KeyDir -PathType Container)) {
-    New-Item -ItemType Directory -Force -Path $KeyDir | Out-Null
-    Write-Output "密钥目录不存在，已创建：$KeyDir"
 }
 if (-not $ExportProgram) {
     $ExportProgram = Join-Path $ToolSource 'aicrm-export-new.exe'
@@ -79,9 +62,173 @@ if (-not (Test-Path -LiteralPath $ExportProgram -PathType Leaf)) {
     throw "找不到 Markdown 导出程序：$ExportProgram（用 -ExportProgram 指定路径）"
 }
 
+# ---- 环境准备（前置校验）----
+# 一台机器能不能跑起来，先查清楚再动磁盘：装完了却用不了，比装不上更难查
+# （实测踩过：缺 VC++ 运行库、磁盘写满、旧进程占着文件）。
+#
+# 输出协议：一行一条 `CHECK|级别|标题|pass/fail|说明` —— 安装器界面直接解析它画清单，
+# 人看也一样清楚；失败另外写进 install.err.log。
+# 级别：required = 不通过就不装；advisory = 只提醒，不拦。
+# 日志位置：正常在安装目录，盘符都不存在这类情况退回临时目录 —— 报错本身不能失败。
+try { $errorLog = Join-Path $InstallDir 'install.err.log' }
+catch { $errorLog = Join-Path $env:TEMP 'AICRM-install.err.log' }
+
+function Write-InstallLog([string]$message) {
+    try {
+        if (-not (Test-Path -LiteralPath $InstallDir)) {
+            New-Item -ItemType Directory -Force -Path $InstallDir -ErrorAction SilentlyContinue | Out-Null
+        }
+        $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') + 'Z'
+        Add-Content -LiteralPath $errorLog -Value "[$stamp] $message" -Encoding UTF8 -ErrorAction SilentlyContinue
+    }
+    catch { }
+}
+
+function Stop-Install([string]$message) {
+    Write-InstallLog "安装未完成：$message"
+    throw $message
+}
+
+# 结果用脚本级变量回传：检查函数只负责打印 CHECK 行，调用方据此决定拦不拦。
+$script:PreflightBlocked = $false
+$script:PreflightFirstFailure = ''
+$script:CrtSource = ''
+
+function Add-Preflight([string]$level, [string]$title, [bool]$passed, [string]$detail) {
+    if (-not $passed -and $level -eq 'required') {
+        $script:PreflightBlocked = $true
+        if (-not $script:PreflightFirstFailure) {
+            $script:PreflightFirstFailure = "$title —— $detail"
+        }
+    }
+    $status = if ($passed) { 'pass' } else { 'fail' }
+    Write-Output ("CHECK|{0}|{1}|{2}|{3}" -f $level, $title, $status, $detail)
+}
+
+function Invoke-Preflight {
+    # 1) 系统版本：Win10 1809 / Server 2019（内部版本 17763）起步 —— 再早的系统上
+    #    托盘、长路径、TLS 都会出问题，与其装完再猜，不如当场说清楚。
+    $version = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    $build = [int]$version.CurrentBuildNumber
+    if ($build -le 0) { $build = [Environment]::OSVersion.Version.Build }
+    Add-Preflight 'required' '系统版本' ($build -ge 17763) "Windows 内部版本 $build（需要 17763 或更高）"
+
+    # 2) 磁盘空间：载荷解出来约 92MB，加上采集产物留 300MB 余量。
+    $drive = (Split-Path -Qualifier $InstallDir).TrimEnd(':', '\')
+    $free = -1
+    try { $free = (Get-PSDrive -Name $drive -ErrorAction Stop).Free }
+    catch { }
+    if ($free -lt 0) {
+        Add-Preflight 'required' '磁盘空间' $false "读不到 $drive 盘的可用空间（盘符是否存在 / 是否可访问？）"
+    }
+    else {
+        Add-Preflight 'required' '磁盘空间' ($free -ge 300MB) ("{0} 盘可用 {1:N0}MB（需要 300MB 以上）" -f $drive, ($free / 1MB))
+    }
+
+    # 3) 安装目录可写。我们是按用户安装、不需要管理员权限 —— 但这两处必须能写。
+    try {
+        New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+        $probe = Join-Path $InstallDir '.preflight-write-probe'
+        [IO.File]::WriteAllText($probe, 'ok')
+        Remove-Item -LiteralPath $probe -Force
+        Add-Preflight 'required' '安装目录可写' $true $InstallDir
+    }
+    catch {
+        Add-Preflight 'required' '安装目录可写' $false "$InstallDir（$($_.Exception.Message)）"
+    }
+
+    # 4) 开机自启项可写
+    try {
+        New-Item -Path $runKey -Force | Out-Null
+        Set-ItemProperty -Path $runKey -Name 'AICRM-PreflightProbe' -Value 'probe'
+        Remove-ItemProperty -Path $runKey -Name 'AICRM-PreflightProbe' -Force
+        Add-Preflight 'required' '开机自启可注册' $true 'HKCU Run'
+    }
+    catch {
+        Add-Preflight 'required' '开机自启可注册' $false $_.Exception.Message
+    }
+
+    # 5) VC++ 运行库：第三方程序（AICRM-Key.exe / aicrm-export-new.exe）改不了链接
+    #    方式，只能在 exe 同目录放一份（应用本地装配）。随包带一份，本机装了也行。
+    $crt = Join-Path $ToolSource 'vcruntime140.dll'
+    if (-not (Test-Path -LiteralPath $crt -PathType Leaf)) {
+        $systemCrt = Join-Path $env:WINDIR 'System32\vcruntime140.dll'
+        if (Test-Path -LiteralPath $systemCrt -PathType Leaf) { $crt = $systemCrt }
+    }
+    $crtFound = Test-Path -LiteralPath $crt -PathType Leaf
+    $script:CrtSource = if ($crtFound) { $crt } else { '' }
+    Add-Preflight 'required' 'VC++ 运行库' $crtFound $(if ($crtFound) {
+        "来源：$crt"
+    } else {
+        '安装包与这台机器上都没有 vcruntime140.dll，采集用的第三方程序起不来'
+    })
+
+    # 6) 云端是否可达：只影响"装完能不能立刻用"，不拦。
+    if ($CloudUrl) {
+        $reachable = $false
+        $detail = "无法连接 $CloudUrl"
+        try {
+            Invoke-WebRequest -Uri $CloudUrl.TrimEnd('/') -Method Head -TimeoutSec 8 -UseBasicParsing | Out-Null
+            $reachable = $true
+            $detail = "已连接 $CloudUrl"
+        }
+        catch {
+            if ($_.Exception.Response) {
+                $reachable = $true
+                $detail = "已连接 $CloudUrl（HTTP $([int]$_.Exception.Response.StatusCode)）"
+            }
+        }
+        Add-Preflight 'advisory' '云端可达' $reachable $detail
+    }
+
+    # 7) 微信是否安装：装机不必须，采集才需要，所以只提醒。
+    $weixin = @()
+    foreach ($root in @($env:ProgramFiles, [Environment]::GetEnvironmentVariable('ProgramFiles(x86)'))) {
+        if ($root) {
+            $weixin += (Join-Path $root 'Tencent\Weixin\Weixin.exe')
+            $weixin += (Join-Path $root 'Tencent\WeChat\WeChat.exe')
+        }
+    }
+    $weixin = @($weixin | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+    Add-Preflight 'advisory' '微信已安装' ($weixin.Count -gt 0) $(if ($weixin.Count -gt 0) {
+        $weixin[0]
+    } else {
+        '没找到微信；装好客户端之后再装微信也可以'
+    })
+}
+
+Invoke-Preflight
+if ($script:PreflightBlocked) { Write-InstallLog "环境准备未通过：$script:PreflightFirstFailure" }
+
+# 只做检查：把结论交给调用方（安装器界面 / 人），一个字节都不动。
+if ($CheckOnly) {
+    if ($script:PreflightBlocked) { exit 1 }
+    exit 0
+}
+if ($script:PreflightBlocked) { Stop-Install "环境准备未通过：$script:PreflightFirstFailure" }
+
 # 开发机从源码构建；部署包里没有 Cargo.toml，直接用随包的可执行文件。
+# 放在环境准备之后：检查没过就不该先花几分钟编译（-CheckOnly 更是一行代码都不动）。
+# 安装目录里的各项路径也在这里才算出来（见文件开头的说明）。
+$exeSource     = Resolve-Binary 'aicrm_windows_api.exe'
+$consoleSource = Resolve-Binary 'aicrm-console.exe'
+$exe           = Join-Path $InstallDir 'aicrm_windows_api.exe'
+$consoleExe    = Join-Path $InstallDir 'aicrm-console.exe'
+$tools       = Join-Path $InstallDir 'tools'
+$data        = Join-Path $InstallDir 'data'
+$tokenFile   = Join-Path $InstallDir 'api.token'
+
+# 密钥目录允许不存在：新机器上密钥还没采集，AICRM-Key.exe 会往里写。
+if (-not (Test-Path -LiteralPath $KeyDir -PathType Container)) {
+    New-Item -ItemType Directory -Force -Path $KeyDir | Out-Null
+    Write-Output "密钥目录不存在，已创建：$KeyDir"
+}
+
 $manifest = Join-Path $PSScriptRoot 'Cargo.toml'
 if (Test-Path -LiteralPath $manifest) {
+    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+        Stop-Install '开发机安装需要 Rust 工具链（cargo 不在 PATH 里）。请把 %USERPROFILE%\.cargo\bin 加进 PATH，或改用打包好的安装程序。'
+    }
     & cargo build --release --locked --manifest-path $manifest
     if ($LASTEXITCODE -ne 0) { throw 'Rust 编译失败' }
 }
@@ -90,7 +237,6 @@ New-Item -ItemType Directory -Force -Path $InstallDir, $tools, $data | Out-Null
 # 覆盖前必须停掉还在跑的旧进程：界面和托盘开着的时候，Copy-Item 会直接撞上
 # "文件正由另一进程使用" 而中断安装。安装器自身不在列表里 —— 停自己会让脚本当场断掉。
 $stopNames = @('aicrm_windows_api.exe', 'aicrm-console.exe', 'aicrm-login.exe')
-if ($KeepConsole) { $stopNames = $stopNames | Where-Object { $_ -ne 'aicrm-console.exe' } }
 foreach ($name in $stopNames) {
     Get-CimInstance Win32_Process -Filter "Name = '$name'" |
         Where-Object { $_.ExecutablePath -like "$InstallDir*" } |
@@ -109,8 +255,7 @@ foreach ($obsolete in @('aicrm-login.exe', 'aicrm-tray.exe', '登录.cmd')) {
 
 Copy-Item -LiteralPath $exeSource -Destination $exe -Force
 Copy-Item -LiteralPath $consoleSource -Destination $consoleExe -Force
-# 把自己也留一份。客户端首次「连接云端」时会再调一次本脚本完成配对
-# （令牌生成、自启项重写、重启服务都在这里，没必要在 Rust 里重写一遍）。
+# 把自己也留一份：以后要改地址 / 修安装时，客户机上就有脚本可用。
 Copy-Item -LiteralPath $PSCommandPath -Destination (Join-Path $InstallDir 'install.ps1') -Force
 # 自更新执行者：客户端收到 agent.update 后靠它替换 exe 并重启。原生 exe，不经解释器。
 $updateSource = Resolve-Binary 'aicrm-update.exe'
@@ -119,72 +264,32 @@ Copy-Item -LiteralPath $updateSource -Destination (Join-Path $InstallDir 'aicrm-
 Copy-Item -LiteralPath (Join-Path $ToolSource 'AICRM-Key.exe') -Destination (Join-Path $tools 'AICRM-Key.exe') -Force
 Copy-Item -LiteralPath $ExportProgram -Destination (Join-Path $tools 'aicrm-export-new.exe') -Force
 
+# VC++ 运行库（来源已在环境准备的第 5 项里确认过）：第三方程序是 MSVC 动态链接的，
+# 客户机没装 VC++ 时它们起不来；把 DLL 放到 exe 同目录即可（应用本地装配）——
+# 不需要管理员、不需要联网、不需要重启。我们自己那几个程序已改成静态链接
+# （见 .cargo/config.toml），带上它只是多一层保险。
+Copy-Item -LiteralPath $script:CrtSource -Destination (Join-Path $tools 'vcruntime140.dll') -Force
+Copy-Item -LiteralPath $script:CrtSource -Destination (Join-Path $InstallDir 'vcruntime140.dll') -Force
+
 # 本地 API 的 Bearer token（安装时生成一次，之后不换）
 if (-not (Test-Path -LiteralPath $tokenFile)) {
     $token = New-HexToken
     [IO.File]::WriteAllText($tokenFile, $token, [Text.Encoding]::ASCII)
 }
 
-# ---- 设备身份与云端配对 ----
-# 注意：PowerShell 变量名大小写不敏感，这里不能用 $deviceId 承接参数 $DeviceId ——
-# 初始化赋值会把参数本身清空。所以本地用一个明确不同的名字。
-$cloudDeviceId = ''
+# ---- 云端地址 ----
+# 写进文件而不是只钉在命令行/自启项里：服务每轮心跳都重读它 —— 换服务器、
+# 换域名只要改这个文件再重启服务即可，不用重装。
+# 没有"设备身份"要落：2026-10-10 取消设备绑定后，客户端与云端的关系只有
+# 一句「哪个账号在我这里登录着」，登录由客户端界面完成，安装这一环不问账号。
+$cloudUrlFile = Join-Path $InstallDir 'cloud.url'
 if ($CloudUrl) {
-    if (Test-Path -LiteralPath $deviceFile) {
-        # 重装沿用既有身份，避免云端把同一台机器认成两台
-        $cloudDeviceId = ([IO.File]::ReadAllText($deviceFile)).Trim()
-    }
-    elseif ($DeviceId) {
-        $cloudDeviceId = $DeviceId.Trim()
-        [IO.File]::WriteAllText($deviceFile, $cloudDeviceId, [Text.Encoding]::ASCII)
-    }
-    else {
-        # 还没连云端：先落一个占位 id，真正的设备身份由服务端在客户端首次
-        # 「连接云端」时签发并覆盖。没有 id 的话自启项里就写不进 --device-id，
-        # 服务起来也不会去连云端。
-        $cloudDeviceId = [guid]::NewGuid().ToString()
-        [IO.File]::WriteAllText($deviceFile, $cloudDeviceId, [Text.Encoding]::ASCII)
-    }
-
-    if (Test-Path -LiteralPath $deviceTokenFile) {
-        Write-Output '设备此前已配对，沿用已有设备令牌。'
-    }
-    elseif (-not $ProvisionCode) {
-        # 静默安装时拿不到账号密码，就谈不上申领配对码。跳过这一段，
-        # 设备身份留给客户端首次「连接云端」时去签发。
-        Write-Output '尚未接入云端命令通道：等客户端首次连接云端时自动完成配对。'
-    }
-    else {
-        # 设备令牌在本机生成，云端只保存 SHA-256，不保存明文。
-        $deviceToken = New-HexToken
-        $payload = @{
-            deviceId    = $cloudDeviceId
-            code        = $ProvisionCode
-            deviceToken = $deviceToken
-            name        = $DeviceName
-        } | ConvertTo-Json -Compress
-        try {
-            $response = Invoke-RestMethod -Method Post -Uri "$($CloudUrl.TrimEnd('/'))/api/agent/v1/provision" `
-                -ContentType 'application/json' -Body $payload -TimeoutSec 30
-        }
-        catch {
-            throw "云端配对失败：$($_.Exception.Message)。预置码有效期只有 10 分钟，过期请重新签发。"
-        }
-        if (-not $response.data.provisioned) { throw "云端未确认配对：$($response | ConvertTo-Json -Compress)" }
-        [IO.File]::WriteAllText($deviceTokenFile, $deviceToken, [Text.Encoding]::ASCII)
-        Write-Output "设备已配对：$cloudDeviceId（$DeviceName）"
-    }
-
-    # 云端地址写进文件，而不是只钉在命令行/自启项里。
-    # 服务每轮心跳都重读它 —— 隧道地址变了（cloudflared 重开、域名轮换）
-    # 只要改这个文件再重启服务即可，不用重装。
-    $cloudUrlFile = Join-Path $InstallDir 'cloud.url'
     [IO.File]::WriteAllText($cloudUrlFile, $CloudUrl.TrimEnd('/'), [Text.Encoding]::ASCII)
 }
 
 # ---- 收紧敏感文件的权限 ----
 $identityName = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-foreach ($sensitive in @($tokenFile, $deviceTokenFile, $deviceFile)) {
+foreach ($sensitive in @($tokenFile)) {
     if (-not (Test-Path -LiteralPath $sensitive)) { continue }
     & icacls $sensitive /inheritance:r /grant:r "${identityName}:(F)" '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "无法限制文件权限：$sensitive" }
@@ -192,7 +297,7 @@ foreach ($sensitive in @($tokenFile, $deviceTokenFile, $deviceFile)) {
 # 导出目录**不再**断继承收紧：它位于 %LOCALAPPDATA% 下，父目录的 ACL 已经把
 # 其它用户挡在外面了。而"收紧到安装者"会造成一个真实的坑 —— IT 用管理员账号
 # 给客户部署之后，客户自己登录打开数据目录只会看到"你当前无权访问该文件夹"。
-# 真正敏感的是上面那三个凭据文件（尤其是能冒充设备的 device.token），已单独收紧。
+# 真正敏感的是上面的令牌文件与登录后写入的登录令牌（api.refresh），都单独收紧。
 if (-not (Test-Path -LiteralPath $data)) { New-Item -ItemType Directory -Path $data -Force | Out-Null }
 
 # ---- 桌面与开始菜单快捷方式 ----
@@ -219,8 +324,8 @@ foreach ($shortcutPath in $shortcutTargets) {
 
 # ---- 注册自启并立即启动 ----
 # 自启项默认**只写一行 exe 路径**：服务从自身所在目录读 tools/accounts/data/凭据文件，
-# 云端地址读 cloud.url、设备身份读 device.token / device.id —— 参数拼装整体消失，
-# 「改了文件不重装没用 / 设备身份两处必须一致」的坑从结构上不再存在。
+# 云端地址读 cloud.url、登录令牌读 api.token —— 参数拼装整体消失，
+# 「改了文件不重装没用」这类坑从结构上不再存在。
 # 只有非常规配置才继续写参数：自定义密钥目录 / 监听地址、额外的网页来源。
 $extraArguments = ''
 if ($KeyDir.TrimEnd('\') -ne (Join-Path $InstallDir 'accounts').TrimEnd('\')) {
@@ -273,9 +378,7 @@ Write-Output "本地 API token：$tokenFile"
 Write-Output "主窗口：$consoleExe"
 Write-Output "快捷方式：AICRM.lnk（桌面 + 开始菜单）"
 if ($CloudUrl) {
-    Write-Output "命令通道：已接入 $($CloudUrl.TrimEnd('/'))"
-    Write-Output "  设备 ID：$cloudDeviceId"
-    Write-Output "  设备令牌：$deviceTokenFile（已限制权限）"
-    Write-Output "  云端地址：$cloudUrlFile（隧道地址变了改这里，再重启服务即可）"
+    Write-Output "云端地址：$cloudUrlFile（服务每轮重读；换服务器改这里再重启服务即可）"
+    Write-Output "  下一步：打开客户端，用云端账号登录一次即可接入命令通道"
 }
-else { Write-Output '提示：加 -CloudUrl <云端基地址> -ProvisionCode <预置码> 可接入云端命令通道' }
+else { Write-Output '提示：加 -CloudUrl <云端基地址> 后，客户端登录一次即可接入云端命令通道' }

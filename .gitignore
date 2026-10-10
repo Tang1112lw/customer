@@ -6,4 +6,5 @@
 
 # 载荷二进制（打包时本地放入，不进 Git）
 /src/tools/*.exe
+/src/tools/*.dll
 /src/tools/cache/

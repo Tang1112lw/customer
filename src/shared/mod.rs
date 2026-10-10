@@ -7,7 +7,7 @@
 //!   其中一部分是常态，用不到的条目由下面的 `allow(dead_code)` 豁免噪音。
 //! - **后台服务**：逐文件 `#[path = "../shared/cache.rs"] pub(crate) mod cache;`
 //!   单独引入 —— 服务端刻意只编译它真正需要的两个文件（缓存探测与机主昵称），
-//!   不碰设备凭据与进程管理。
+//!   不碰账号凭据与进程管理。
 //!
 //! 两条约定：
 //!
@@ -21,7 +21,10 @@
 #![allow(dead_code)]
 
 pub mod cache;
-pub mod device;
+pub mod credentials;
+pub mod dialog;
 pub mod paths;
+pub mod preflight;
 pub mod process;
 pub mod self_name;
+pub mod session;

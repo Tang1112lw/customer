@@ -18,12 +18,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut data = root.join("data");
     let mut token_file = root.join("api.token");
     let mut bind = "127.0.0.1:8765".to_owned();
-    // 云端命令通道：三项都齐了才启用轮询，缺任一就只跑本地 API。
+    // 云端命令通道：**只认登录**（api.token 是云端会话时才接入；见下方接入判断）。
     let mut cloud_url = None;
     let mut cloud_url_file = None;
-    let mut device_token = None;
-    let mut device_token_file = None;
-    let mut device_id = None;
     // 允许调用本客户端接口的网页来源，可重复。部署到客户机器时用来放行云端域名。
     let mut allow_origins: Vec<String> = Vec::new();
 
@@ -32,16 +29,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if flag == "--help" {
             println!(
                 "AICRM Windows API（参数全部可选）：\n  \
-                 缺省时一切从 exe 同目录读：tools/、accounts/、data/、api.token、\n  \
-                 cloud.url（云端地址）、device.token / device.id（设备身份）。\n  \
+                 缺省时一切从 exe 同目录读：tools/、accounts/、data/、api.token、cloud.url。\n  \
                  --tools-dir DIR --key-dir DIR --data-dir DIR --token-file FILE --bind IP:PORT\n  \
-                 命令通道（可选，凭据齐全才启用）：\n  \
+                 命令通道（登录后才启用；没有配对、没有设备身份）：\n  \
                  --cloud-url URL            云端基地址，如 https://api.example.com\n  \
                  --cloud-url-file FILE      从文件读云端基地址。隧道地址会变时用这个：\n  \
                                             改文件即可，不用重装（每轮轮询都会重读）\n  \
-                 --device-token TOK         设备令牌（明文写在命令行，仅调试用）\n  \
-                 --device-token-file FILE   设备令牌文件（推荐：不会出现在命令行和自启项里）\n  \
-                 --device-id ID             设备标识"
+                 --device-token / --device-token-file / --device-id  已废弃：\n  \
+                                            仅兼容旧版自启项，解析后忽略"
             );
             return Ok(());
         }
@@ -56,9 +51,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--bind" => bind = value,
             "--cloud-url" => cloud_url = Some(value),
             "--cloud-url-file" => cloud_url_file = Some(PathBuf::from(value)),
-            "--device-token" => device_token = Some(value),
-            "--device-token-file" => device_token_file = Some(PathBuf::from(value)),
-            "--device-id" => device_id = Some(value),
+            // 设备绑定（配对 / 设备令牌）已于 2026-10-10 取消：这三个参数只为
+            // 老版本装出来的自启项兼容而保留 —— 解析但不使用，缺了它们也不报错。
+            "--device-token" | "--device-token-file" | "--device-id" => {}
             // 网页来源白名单，可重复。例：--allow-origin https://aicrm.example.com
             "--allow-origin" => allow_origins.push(value),
             _ => return Err(io::Error::other(format!("未知参数: {flag}")).into()),
@@ -94,25 +89,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 参数解析完毕，data 目录已确定，这时才能找「已就绪」的更新。
-    // 设备令牌：exe 旁的 `device.token` **优先于一切命令行参数** —— 文件是唯一事实
-    // 来源，老版本自启项里钉着的参数不会再和文件打架（README 里「设备身份有两处、
-    // 必须一致」那个坑的结构性正解）。文件不存在时才回落到命令行（旧部署 / 联调）。
-    // 顺带的安全性：命令行里的令牌会出现在进程列表和 HKCU Run 自启项中。
-    let device_token = match read_trimmed(&root.join("device.token")) {
-        Some(token) => Some(token),
-        None => match (device_token_file, device_token) {
-            (Some(path), _) => Some(std::fs::read_to_string(&path).map_err(|error| {
-                io::Error::other(format!("读取设备令牌文件 {} 失败：{error}", path.display()))
-            })?),
-            (None, inline) => inline,
-        }
-        .map(|token| token.trim().to_owned())
-        .filter(|token| !token.is_empty()),
-    };
+    // 客户端实例标识：本地生成（UUID），只用于云端区分同一个账号的多台电脑 ——
+    // 它就是「一个账号只能登录一个客户端」的判定依据。
+    // **不是凭据**：不需要任何签发或配对，生成一次后不再变化。
+    let client_id = read_trimmed(&root.join("client.id")).unwrap_or_else(|| {
+        let generated = uuid::Uuid::new_v4().to_string();
+        let _ = std::fs::write(root.join("client.id"), &generated);
+        generated
+    });
 
-    // 设备 ID：同样文件优先。
-    let device_id = read_trimmed(&root.join("device.id")).or(device_id);
+    // 命令通道**只认登录**：api.token 是一个没过期的云端会话令牌（登录 / 续期写入）
+    // 时才接入。安装时生成的本地随机令牌不算登录，过期的令牌也不算。
+    let logged_in = std::fs::read_to_string(&token_file)
+        .map(|text| backend::session::token_is_live(&text))
+        .unwrap_or(false);
 
     backend::set_allowed_origins(allow_origins);
     // 云端地址：exe 旁的 `cloud.url` 存在时即为唯一事实来源（隧道地址会变，改文件
@@ -126,13 +116,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     backend::set_cloud_origin(cloud_url.clone(), cloud_url_file.clone());
 
-    // 令牌文件路径后面还要给设备认领用（读登录令牌），这里保留一份。
+    // 令牌文件路径还要交给命令通道（每次请求现读登录令牌），这里保留一份。
     let service = Service::new(tools, keys, data, token_file.clone())?;
 
-    // 云端三项凭据（地址 + 设备令牌 + 设备 ID）齐全才启用命令通道；缺任一就只跑本地 API。
-    if let (Some(device_token), Some(device_id)) = (device_token, device_id)
-        && (cloud_url.is_some() || cloud_url_file.is_some())
-    {
+    // 云端地址 + 已登录，两样齐了才启用命令通道；缺任一就只跑本地 API。
+    if logged_in && (cloud_url.is_some() || cloud_url_file.is_some()) {
         match &cloud_url_file {
             Some(path) => eprintln!("命令通道已启用，云端地址读自 {}", path.display()),
             None => eprintln!(
@@ -145,10 +133,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             agent_service::CloudConfig {
                 base_url: cloud_url.unwrap_or_default(),
                 base_url_file: cloud_url_file,
-                // 设备归属跟着登录账号走：换账号登录后重启客户端，设备自动改挂过去。
+                // 归属就是登录账号本身：换账号登录后重启客户端，网页端立刻看到新账号。
                 user_token_file: Some(token_file.clone()),
-                device_token,
-                device_id,
+                client_id,
                 interval: POLL_INTERVAL,
             },
         );
@@ -166,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// 读一个"一行文本"配置文件；不存在或为空白返回 `None`。
 ///
-/// 与服务共处的 `cloud.url` / `device.token` / `device.id` 都用它读 ——
+/// 与服务共处的 `cloud.url` / `client.id` 都用它读 ——
 /// 判定口径一致（去空白、空文件不算存在）。
 fn read_trimmed(path: &std::path::Path) -> Option<String> {
     std::fs::read_to_string(path)

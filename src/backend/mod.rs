@@ -4,6 +4,8 @@ pub(crate) mod sha256;
 pub(crate) mod cache;
 #[path = "../shared/self_name.rs"]
 pub(crate) mod self_name;
+#[path = "../shared/session.rs"]
+pub(crate) mod session;
 pub mod service;
 pub mod tools_api;
 

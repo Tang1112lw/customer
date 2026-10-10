@@ -219,7 +219,6 @@ impl Service {
         let directory = self.data.join("state");
         fs::create_dir_all(&directory).map_err(|_| ApiError::io())?;
         let payload = json!({
-            "deviceId": "",
             "wxid": wxid,
             "name": name,
             "source": "local",

@@ -24,8 +24,8 @@
 //! 取命令 `POST <cloud>/api/agent/v1/commands/poll`：
 //!
 //! ```http
-//! Authorization: Device <deviceToken>
-//! X-AICRM-Device-ID: <deviceId>
+//! Authorization: Bearer <api.token 里的登录令牌>
+//! X-AICRM-Client-ID: <本机客户端实例标识>
 //! ```
 //! ```json
 //! {"code":0,"message":"success","data":{"command":null}}
@@ -114,7 +114,12 @@ const TOKEN_REFRESH_SECONDS: u64 = 30 * 60;
 /// 取 20 秒留出抖动余量。
 const HEARTBEAT_SECONDS: u64 = 20;
 
-/// 云端基地址与设备凭据。
+/// 云端基地址与登录凭据。
+///
+/// **2026-10-10 起取消设备绑定（零配对）**：没有设备令牌、没有预置码、没有配对
+/// 流程。命令通道只认**登录令牌**（api.token 里的云端会话 JWT）；`client_id` 是
+/// 本机生成的**客户端实例标识**，仅用于云端落实"一个账号只能登录一个客户端"。
+/// 云端侧契约见 README「服务端对接契约（零配对）」。
 #[derive(Clone, Debug)]
 pub struct CloudConfig {
     /// 固定基地址。`base_url_file` 存在时以文件内容为准。
@@ -124,13 +129,13 @@ pub struct CloudConfig {
     pub base_url_file: Option<std::path::PathBuf>,
     /// 本机登录账号的云端令牌文件（api.token）。
     ///
-    /// 设备本身只是机器身份，不归账号所有；「谁在用这台设备」由云端会话表达。
-    /// 客户端每次心跳都现读这个文件并把令牌带给云端，网页端据此列出属于当前
-    /// 登录账号的设备 —— 换账号登录（文件被登录程序重写）下一次心跳就生效，
-    /// 不需要重新配对、不需要重启、也不会挪动任何按账号隔离的数据。
+    /// 命令通道的全部鉴权就靠它：每次请求现读，直接作为 `Authorization: Bearer`
+    /// 上送 —— 云端凭它知道"谁在用这台机器"。换账号登录（文件被主控台重写）
+    /// 下一次请求就生效，不需要重新登录、不需要改任何归属字段。
     pub user_token_file: Option<std::path::PathBuf>,
-    pub device_token: String,
-    pub device_id: String,
+    /// 客户端实例标识（本机生成的 UUID）。云端用它区分同一账号的多台电脑 ——
+    /// 也就是「一个账号只能登录一个客户端」的判定依据。
+    pub client_id: String,
     /// 轮询间隔。太密会被云端限流，太疏用户点了要等。
     pub interval: Duration,
 }
@@ -415,17 +420,12 @@ async fn send_heartbeat(service: &Service, config: &CloudConfig) -> ApiResult<()
     let config = config.clone();
     blocking(move || {
         let endpoint = format!("{}/api/agent/v1/status", config.base_url());
-        let request = agent()
-            .put(&endpoint)
-            .header("Authorization", &format!("Device {}", config.device_token))
-            .header("X-AICRM-Device-ID", &config.device_id)
-            .header("Content-Type", "application/json");
-        // 每次心跳现读登录令牌：告诉云端「这台设备上现在是哪个账号在登录」。
-        // 换账号登录会重写这个文件，下一次心跳（20 秒内）云端就认得新账号了。
-        let request = match current_user_token(&config) {
-            Some(token) => request.header("X-AICRM-User-Token", &token),
-            None => request,
-        };
+        // 只认登录：Bearer = 本机登录令牌（每次现读，换账号下一次心跳即生效），
+        // X-AICRM-Client-ID = 客户端实例标识（云端靠它落实"一个账号一个客户端"）。
+        let request = agent_auth(
+            &config,
+            agent().put(&endpoint).header("Content-Type", "application/json"),
+        )?;
         let status = request
             .send(body.as_str())
             .map_err(|error| ApiError::helper(format!("云端不可达：{error}")))?
@@ -507,6 +507,20 @@ fn current_user_token(config: &CloudConfig) -> Option<String> {
     (!token.is_empty()).then_some(token)
 }
 
+/// 命令通道统一鉴权：**只认登录令牌**（Bearer）+ 自声明的安装实例 ID。
+///
+/// 取消设备绑定后不再有设备令牌 —— 未登录时命令通道根本不启动（见 `main.rs`
+/// 的接入判断），这里拿不到令牌只可能是登录刚被清掉，按错误上报即可。
+fn agent_auth<B>(
+    config: &CloudConfig,
+    request: ureq::RequestBuilder<B>,
+) -> ApiResult<ureq::RequestBuilder<B>> {
+    let token = current_user_token(config).ok_or_else(|| ApiError::helper("本机未登录"))?;
+    Ok(request
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("X-AICRM-Client-ID", &config.client_id))
+}
+
 /// 取一次命令并执行。`Ok(false)` 表示本次没有任务。
 async fn tick(service: &Service, config: &CloudConfig) -> ApiResult<bool> {
     let Some(command) = poll(config).await? else {
@@ -558,12 +572,14 @@ async fn poll(config: &CloudConfig) -> ApiResult<Option<Command>> {
         // 云端用长轮询：请求体会被挂起，直到有任务或 waitSeconds 到期。
         // 少了这个字段（或值不在 5..=60）云端直接 400。
         let body = format!("{{\"waitSeconds\":{POLL_WAIT_SECONDS}}}");
-        let mut response = agent()
-            .post(&endpoint)
-            .header("Authorization", &format!("Device {}", config.device_token))
-            .header("X-AICRM-Device-ID", &config.device_id)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
+        let request = agent_auth(
+            &config,
+            agent()
+                .post(&endpoint)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json"),
+        )?;
+        let mut response = request
             .send(body.as_str())
             .map_err(|error| ApiError::helper(format!("云端不可达：{error}")))?;
 
@@ -735,12 +751,12 @@ async fn report_command_progress(config: &CloudConfig, command: &Command, progre
             config.base_url()
         );
         let body = serde_json::json!({ "progress": progress, "message": message }).to_string();
-        let _ = agent()
-            .put(&endpoint)
-            .header("Authorization", &format!("Device {}", config.device_token))
-            .header("X-AICRM-Device-ID", &config.device_id)
-            .header("Content-Type", "application/json")
-            .send(body.as_str());
+        if let Ok(request) = agent_auth(
+            &config,
+            agent().put(&endpoint).header("Content-Type", "application/json"),
+        ) {
+            let _ = request.send(body.as_str());
+        }
         Ok::<(), ApiError>(())
     })
     .await;
@@ -756,11 +772,11 @@ async fn report(config: &CloudConfig, command: &Command, outcome: Report) -> Api
             "{}/api/agent/v1/commands/{command_id}/result",
             config.base_url()
         );
-        let status = agent()
-            .put(&endpoint)
-            .header("Authorization", &format!("Device {}", config.device_token))
-            .header("X-AICRM-Device-ID", &config.device_id)
-            .header("Content-Type", "application/json")
+        let request = agent_auth(
+            &config,
+            agent().put(&endpoint).header("Content-Type", "application/json"),
+        )?;
+        let status = request
             .send(body.as_str())
             .map_err(|error| ApiError::helper(format!("回传结果失败：{error}")))?
             .status();
@@ -1024,8 +1040,9 @@ impl Service {
             return Ok(ready);
         }
 
-        let device_token = config.device_token.clone();
-        let device_id = config.device_id.clone();
+        // 下载也走登录令牌（与命令通道同一套鉴权）。
+        let user_token = current_user_token(config).ok_or_else(|| ApiError::helper("本机未登录"))?;
+        let client_id = config.client_id.clone();
         let base = config.base_url();
         let stage_dir = install_dir.join("updates").join(&version);
         let staged = blocking(move || {
@@ -1038,8 +1055,8 @@ impl Service {
                 // timeout: global"，整包更新永远走不完）。
                 let response = download_agent()
                     .get(&url)
-                    .header("Authorization", &format!("Device {device_token}"))
-                    .header("X-AICRM-Device-ID", &device_id)
+                    .header("Authorization", &format!("Bearer {user_token}"))
+                    .header("X-AICRM-Client-ID", &client_id)
                     .call()
                     .map_err(|error| ApiError::helper(format!("下载 {target} 失败：{error}")))?;
                 let bytes = response
@@ -1186,11 +1203,12 @@ async fn refresh_bound_wechat(service: &Service, config: &CloudConfig) -> ApiRes
         return Ok(());
     };
     let base = config.base_url().to_owned();
-    let device_id = config.device_id.clone();
+    let client_id = config.client_id.clone();
     let state_dir = service.data.join("state");
 
     blocking(move || {
-        let url = format!("{base}/api/ui/v1/devices");
+        // 云端现在只回答「这个账号的客户端」—— 一个对象，不再有设备列表。
+        let url = format!("{base}/api/ui/v1/client");
         let mut response = agent()
             .get(&url)
             .header("Authorization", &format!("Bearer {token}"))
@@ -1202,18 +1220,10 @@ async fn refresh_bound_wechat(service: &Service, config: &CloudConfig) -> ApiRes
             .read_to_string()
             .map_err(|_| ApiError::io())?;
         let value: Value =
-            serde_json::from_str(&text).map_err(|_| ApiError::helper("设备列表响应不合法"))?;
-        let bound = value
-            .get("data")
-            .and_then(|data| data.get("devices"))
-            .and_then(|list| list.as_array())
-            .and_then(|list| {
-                list.iter().find(|item| {
-                    item.get("id").and_then(|value| value.as_str()) == Some(device_id.as_str())
-                })
-            });
+            serde_json::from_str(&text).map_err(|_| ApiError::helper("客户端状态响应不合法"))?;
+        let bound = value.get("data").and_then(|data| data.get("client"));
         let record = json!({
-            "deviceId": device_id,
+            "clientId": client_id,
             "wxid": bound.and_then(|item| item.get("boundWxid")).and_then(|v| v.as_str()).unwrap_or(""),
             "name": bound.and_then(|item| item.get("boundName")).and_then(|v| v.as_str()).unwrap_or(""),
             "source": "cloud",
