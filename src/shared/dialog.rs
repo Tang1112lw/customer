@@ -42,8 +42,19 @@ pub fn report_failure(log: &Path, scope: &str, message: &str) -> String {
     } else {
         format!("{scope}\n\n{message}\n\n详细日志：{path}")
     };
-    message_box("AICRM", &text);
+    message_box("AICRM", &text, false);
     path
+}
+
+/// 弹一个原生提示框（成功场景）。用信息图标，而不是错误图标。
+///
+/// 只有**无界面安装**这条路用得上：那台机器的显卡只给了 OpenGL 1.1，窗口在创建
+/// 阶段就失败，这个框是用户唯一能看到的结果 —— 不弹就等于"双击了没反应"。
+///
+/// 刻意只弹框、不写日志：成功时用户要的是"装好了"这句话，不是一串路径；
+/// "这次走了无界面安装"这件事，在降级那一刻已经记进日志了。
+pub fn report_success(scope: &str, message: &str) {
+    message_box("AICRM", &format!("{scope}\n\n{message}"), true);
 }
 
 /// 崩溃兜底：panic 同样留痕并弹提示 —— GUI 里 panic 只会让窗口凭空消失。
@@ -56,9 +67,14 @@ pub fn install_panic_reporter(log: PathBuf, scope: &'static str) {
     }));
 }
 #[cfg(windows)]
-fn message_box(title: &str, text: &str) {
+fn message_box(title: &str, text: &str, information: bool) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MessageBoxW,
+        MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MessageBoxW,
+    };
+    let icon = if information {
+        MB_ICONINFORMATION
+    } else {
+        MB_ICONERROR
     };
     let wide = |value: &str| -> Vec<u16> {
         std::os::windows::ffi::OsStrExt::encode_wide(std::ffi::OsStr::new(value))
@@ -75,13 +91,13 @@ fn message_box(title: &str, text: &str) {
             std::ptr::null_mut(),
             text.as_ptr(),
             caption.as_ptr(),
-            MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
+            MB_OK | icon | MB_SETFOREGROUND | MB_TOPMOST,
         );
     }
 }
 
 #[cfg(not(windows))]
-fn message_box(title: &str, text: &str) {
+fn message_box(title: &str, text: &str, _information: bool) {
     eprintln!("{title}\n{text}");
 }
 

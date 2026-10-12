@@ -46,6 +46,17 @@ const TOOLS: [&str; 4] = [
     "vcruntime140.dll",
     "使用手册.txt",
 ];
+// 软件 OpenGL（Mesa llvmpipe）：远程桌面会话、或没装显卡驱动的机器，本机只给到
+// OpenGL 1.1，而界面框架（eframe/glow）要求 2.0+，窗口在创建阶段就失败。把这组
+// DLL 随包带上、由 install.ps1 放进安装目录（应用本地装配），客户端改用纯软件
+// 渲染，窗口在任何机器上都能开。见 install.ps1 与 `forckend/console.rs`。
+const SWGL: [&str; 5] = [
+    "opengl32.dll",
+    "libgallium_wgl.dll",
+    "msvcp140.dll",
+    "vcruntime140.dll",
+    "vcruntime140_1.dll",
+];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -90,8 +101,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut total,
             )?;
         }
+        // 软件 OpenGL 放在 tools\swgl\ 下 —— install.ps1 的辅助程序来源目录里，
+        // 部署包和开发机都能按同一个相对位置找到（见 install.ps1 的 ToolSource）。
+        for name in SWGL {
+            add(
+                &mut writer,
+                options,
+                &root.join("src").join("tools").join("swgl").join(name),
+                &format!("tools/swgl/{name}"),
+                &mut total,
+            )?;
+        }
         writer.finish()?;
-        let files = SCRIPTS.len() + BINARIES.len() + TOOLS.len();
+        let files = SCRIPTS.len() + BINARIES.len() + TOOLS.len() + SWGL.len();
         println!("载荷：{files} 个文件，原始 {total} 字节 → 压缩后 {} 字节", payload.len());
     }
 

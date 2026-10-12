@@ -8,3 +8,6 @@
 /src/tools/*.exe
 /src/tools/*.dll
 /src/tools/cache/
+# 软件 OpenGL（Mesa llvmpipe，见 README「2026-10-12（下午）」）：同样是打包时本地放入的
+# 二进制（其中一个 61.8MB），不进 Git。构建安装程序前需按文档把这 5 个文件放到位。
+/src/tools/swgl/

@@ -13,8 +13,12 @@
 //!
 //! 用法：
 //! ```text
-//! aicrm-setup.exe [--endpoint https://云端地址]
+//! aicrm-setup.exe [--endpoint https://云端地址] [--silent] [--check]
 //! ```
+//!
+//! `--silent` 是不创建窗口的安装路径：显卡只给 OpenGL 1.1 的机器（驱动没装全，
+//! 或通过「远程桌面」操作）窗口创建会失败，这时安装器**自动降级**到这条路上；
+//! 实施人员也可以显式指定。见 [`install_without_window`]。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -98,6 +102,15 @@ fn run() -> eframe::Result {
         run_check_only(&endpoint);
     }
 
+    // 无界面安装：不创建窗口，直接解载荷 → 跑 install.ps1。
+    // 给两类场景用：① 实施人员明知这台机器显卡不行（远程 / 无人值守）；
+    // ② 窗口创建失败时的兜底（见下面 run_native 的分支）。
+    let silent_requested = arguments.iter().any(|item| item == "--silent")
+        || arguments.iter().any(|item| item == "--no-gui");
+    if silent_requested {
+        install_without_window(&endpoint, "命令行指定无界面安装");
+    }
+
     // 与主界面共用一把锁：安装器和客户端不许并排出现。已经有一个界面在跑就
     // 把它叫到前台，自己退出。
     if !single::acquire() {
@@ -121,7 +134,9 @@ fn run() -> eframe::Result {
             .with_title("AICRM 安装"),
         ..Default::default()
     };
-    eframe::run_native(
+    // 降级路径还要用地址，而 endpoint 会被 move 进下面的闭包。
+    let fallback_endpoint = endpoint.clone();
+    match eframe::run_native(
         "AICRM 安装",
         options,
         Box::new(move |cc| {
@@ -129,7 +144,14 @@ fn run() -> eframe::Result {
             theme::apply(&cc.egui_ctx);
             Ok(Box::new(SetupApp::new(endpoint)))
         }),
-    )
+    ) {
+        Ok(()) => Ok(()),
+        // 窗口创建失败不再直接放弃。客户机显卡只给 OpenGL 1.1 时，eframe 在这里报
+        // "egui_glow requires opengl 2.0+"；可是**安装本身不需要窗口** ——
+        // 解载荷、跑 install.ps1 就够了。让"能不能画窗口"决定"能不能安装"，
+        // 结果是本来能装的机器被一句显卡提示挡在门外（实测：客户的 Win10 就是这样）。
+        Err(error) => install_without_window(&fallback_endpoint, &error.to_string()),
+    }
 }
 
 /// 内嵌载荷的页脚：`[offset u64][len u64]["AICRMSFX"]`，贴在 exe 末尾 24 字节。
@@ -247,16 +269,24 @@ fn remove_self_after_exit() {
     let script = format!("ping -n 4 127.0.0.1 >nul & del /f /q \"{}\"", exe.display());
     let mut command = Command::new("cmd.exe");
     command
-        .args(["/c", &script])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    // 参数必须走 raw_arg，不能走 args：args 会给含空格的参数自动加外层引号、并把
+    // 内部的 `"` 转义成 `\"`，而 cmd.exe 不认这种转义 —— del 拿到的是坏路径，
+    // 删除静默失败。这段「装完把自己删掉」因此从来没生效过（实测：安装器跑完，
+    // 安装包原封不动地还在原地）。raw_arg 原样传递，cmd 收到的正是上面那条 script。
+    // 同一个 Command 上 raw_arg 与 args 不能混用（会 panic），所以分成两个互斥分支。
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
+        command
+            .raw_arg(format!("/c {script}"))
+            .creation_flags(CREATE_NO_WINDOW);
     }
+    #[cfg(not(windows))]
+    command.args(["/c", &script]);
     let _ = command.spawn();
 }
 
@@ -358,6 +388,114 @@ fn run_check_only(endpoint: &str) -> ! {
     };
     shared::dialog::report_failure(&log, "AICRM 环境检查", &summary);
     std::process::exit(if blocking.is_empty() { 0 } else { 1 });
+}
+
+/// 解出载荷 → 跑 `install.ps1`（真正安装，不带 `-CheckOnly`）。
+///
+/// 窗口路径与无界面路径共用这一份：解包、脚本定位、失败判定只有一处实现，
+/// 不会出现"改了 GUI 那条、忘了无界面那条"。
+///
+/// `prepared` 是环境准备阶段已经解好的载荷目录（窗口路径复用它，少解一遍）；
+/// 无界面路径没有这一步，传 None，现场解。
+fn install_payload(base: &str, prepared: Option<PathBuf>) -> Result<String, String> {
+    let work = match prepared {
+        Some(dir) => dir,
+        // 取出随包的程序与脚本：优先用内嵌载荷（单文件安装程序），
+        // 没有载荷就退回"和本 exe 同目录"的旧布局（开发机手工分发用）。
+        None => unpack_payload().or_else(|_| {
+            std::env::current_exe()
+                .map_err(|error| format!("取不到自身路径：{error}"))?
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| "安装包路径异常".to_owned())
+        })?,
+    };
+    let script = work.join("install.ps1");
+    if !script.is_file() {
+        return Err(
+            "安装包里缺少 install.ps1 —— 请使用打包后的单文件安装程序（aicrm-pack 产物）"
+                .to_owned(),
+        );
+    }
+    let (log, ok) = run_script(&script, base, false)?;
+    if !ok {
+        return Err(format!("安装脚本失败：\n{}", log.trim()));
+    }
+    let _ = std::fs::remove_dir_all(&work);
+    Ok(log)
+}
+
+/// 无界面安装：不创建窗口，解出载荷 → 跑 `install.ps1` → 拉起客户端。
+///
+/// 为什么必须有这条路：安装器是 GUI，要求显卡提供 OpenGL 2.0+。客户机若只有
+/// Windows 自带的 OpenGL 1.1（显卡驱动没装全，或通过「远程桌面」连接操作），
+/// 窗口在**创建阶段**就失败 —— 那时 `install.ps1` 还没机会跑，客户看到的只有
+/// "安装程序启动失败"。可这台机器本来是能装的：安装动作只是解载荷 + 跑脚本，
+/// 一个窗口都不需要。
+///
+/// 反馈只用 Win32 原生提示框（`MessageBoxW`，不依赖 OpenGL）—— 这类机器上，
+/// 它是唯一还弹得出来的东西。
+///
+/// 不返回：装完直接拉起客户端并退出进程（收尾与窗口路径一致）。
+fn install_without_window(endpoint: &str, reason: &str) -> ! {
+    let log = setup_error_log();
+    let base = endpoint.trim().trim_end_matches('/').to_owned();
+
+    // 走这条路不是"故障"，是这台机器的显卡能力 —— 记一条日志便于事后分辨
+    // （客户把日志发回来时能看出这次是怎么装上的），但不弹错误框吓人。
+    shared::dialog::write_failure(&log, "未创建安装窗口，改用无界面安装", reason);
+
+    // `install.ps1` 结尾会把主控台拉起来。先把单实例名额放掉 —— 还握着这把锁的话，
+    // 主控台一启动就被自己挡回去（表现就是"装完了但客户端弹不出来"）。
+    // 命令行 `--silent` 进来时本进程没抢过锁，这里是一次空操作。
+    single::release();
+
+    let outcome = if base.is_empty() {
+        Err("打包时未填入云端地址".to_owned())
+    } else {
+        install_payload(&base, None)
+    };
+
+    match outcome {
+        Ok(_) => {
+            // 与窗口路径同一套收尾：删掉安装包自己（客户桌面上只该有一个客户端图标），
+            // 再把客户端叫出来。
+            remove_self_after_exit();
+            let note = open_console()
+                .unwrap_or_else(|error| format!("\n客户端没能自动打开，请从桌面图标启动：{error}"));
+            // "为什么界面起不来"必须归因准确：远程桌面和显卡驱动这两种情况，
+            // 用户该做的事完全不同 —— 说错了等于把他往反方向指。
+            let cause = if std::env::var("SESSIONNAME")
+                .map(|name| name.to_ascii_uppercase().starts_with("RDP-"))
+                .unwrap_or(false)
+            {
+                "\n本次是在「远程桌面」会话里运行的。远程桌面会把 OpenGL 强制降到 1.1，\
+                 即使显卡驱动完好，界面也起不来。让使用者在「这台电脑上」双击运行一次\
+                 安装程序，界面就能正常显示。"
+            } else {
+                "\n通常是因为显卡驱动没装好、或版本过旧。补装一遍显卡驱动（或让 Windows \
+                 Update 打上），客户端界面就能正常打开。"
+            };
+            shared::dialog::report_success(
+                "AICRM 安装完成",
+                &format!(
+                    "客户端已装好并注册了开机自启。\n\n\
+                     这次是无界面安装：安装程序的界面没能显示出来（它需要 OpenGL 2.0+），\
+                     但安装结果与正常安装完全一致。{cause}\n\n\
+                     界面打不开不影响使用：采集与上传由后台服务承担，网页端照常操作。{note}"
+                ),
+            );
+            std::process::exit(0);
+        }
+        Err(message) => {
+            shared::dialog::report_failure(
+                &log,
+                "AICRM 安装失败",
+                &format!("{message}\n\n请把这条信息连同日志一起发给技术支持。"),
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 /// 打开客户端。
@@ -630,27 +768,7 @@ impl SetupApp {
 
         std::thread::spawn(move || {
             let outcome = (|| -> Result<String, String> {
-                // 取出随包的程序与脚本：优先用内嵌载荷（单文件安装程序），
-                // 没有载荷就退回"和本 exe 同目录"的旧布局（开发机手工分发用）。
-                let work = match prepared {
-                    Some(dir) => dir,
-                    None => unpack_payload().or_else(|_| {
-                        std::env::current_exe()
-                            .map_err(|error| format!("取不到自身路径：{error}"))?
-                            .parent()
-                            .map(Path::to_path_buf)
-                            .ok_or_else(|| "安装包路径异常".to_owned())
-                    })?,
-                };
-                let script = work.join("install.ps1");
-                if !script.is_file() {
-                    return Err("安装包里缺少 install.ps1".to_owned());
-                }
-                let (log, ok) = run_script(&script, &base, false)?;
-                if !ok {
-                    return Err(format!("安装脚本失败：\n{}", log.trim()));
-                }
-                let _ = std::fs::remove_dir_all(&work);
+                let log = install_payload(&base, prepared)?;
                 Ok(format!(
                     "{log}\n\n下一步：客户端打开后会用云端账号登录一次，\
                      以后打开就直接进主界面。"

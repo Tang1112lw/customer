@@ -23,7 +23,7 @@
 | `aicrm_windows_api` | `src/main.rs` | 后台服务：HTTP 接口 + 云端命令通道。参数全部可选，默认从 exe 同目录读配置 | 无界面，由 `HKCU\...\Run` 隐藏启动 |
 | `aicrm-console` | `src/forckend/console.rs` | 主窗口：侧边栏 + 状态总览（云端 / 密钥 / 服务）+ 配置页 + 账号菜单；**登录 / 重新登录 / 首次「连接云端」配对都在这一窗口内完成**；**托管本地服务**；托盘形态由 `--hidden` 提供（原独立托盘程序已并入） | 无参数；`--hidden` 只进托盘不弹窗；`--start-service` 只起服务不显示窗口 |
 | `aicrm-update` | `src/update/main.rs` | **原生更新器**（取代 PowerShell 脚本）：校验摘要与目标名白名单 → 先停客户端进程 → 备份 → 覆盖 → 按 `startup.json` 重启 → 探活失败回滚；也承担快捷方式创建（`--ensure-shortcut`）与旧程序清理 | 由服务在应用更新时拉起；`--ensure-shortcut` 供安装脚本调用 |
-| `aicrm-setup` | `src/forckend/setup.rs` | **静默安装**：不问任何东西，打开即装盘 → 装完自动拉起客户端 → 自己退出 | `--endpoint`；`--extract-only` 自检内嵌载荷。单文件形态由 `aicrm-pack` 拼出 |
+| `aicrm-setup` | `src/forckend/setup.rs` | **静默安装**：不问任何东西，打开即装盘 → 装完自动拉起客户端 → 自己退出。**窗口创建失败（显卡只给 OpenGL 1.1）时自动降级为无界面安装**，不再以"启动失败"收场 | `--endpoint`；`--extract-only` 自检内嵌载荷；`--silent` 强制无界面安装。单文件形态由 `aicrm-pack` 拼出 |
 | `aicrm-pack` | `src/pack/main.rs` | 打包工具：安装器 + 全部载荷 → 单文件安装程序 | `cargo run --release --bin aicrm-pack [输出路径]` |
 
 （`aicrm-login.exe` 登录窗口已于 2026-10-10 并入主控台，不再分发。）
@@ -283,6 +283,102 @@ Invoke-RestMethod "$base/api/aicrm/export" -Method Post -Headers $headers `
 （该次测试涉及的 `/export/stream`、`/export/bundle`、`/export/ai-bundle` 三个"下载原始数据"接口，经 2026-10-10 审计确认前端与云命令通道都不再调用，已删除 —— 需要时从 git 历史取回；`/export`（本地文件）与 `/collect`（采集上传）保留。）
 
 ## 更新记录
+
+### 2026-10-12（安装器：窗口起不来也能装）
+
+**背景**：客户机（Win10）双击安装程序报
+`egui_glow: OpenGL: egui_glow requires opengl 2.0+`，随即退出，一个文件都没装上。
+
+**根因**：安装器是 eframe/egui（glow 后端），要求显卡提供 OpenGL 2.0+；那台机器只给出 **1.1**。
+要么显卡驱动没装全（「Microsoft 基本显示适配器」只有 1.1 的软件实现），
+要么实施人员是**通过「远程桌面」**连过去操作的（RDP 会把 OpenGL 强制降到 1.1，与驱动无关）。
+窗口在**创建阶段**就失败，而这一步在 `install.ps1` 之前 —— 所以安装根本没开始。
+
+**改法**（`src/forckend/setup.rs`、`src/shared/dialog.rs`）：
+
+- **窗口起不来就换一条路走，而不是放弃**：`run_native` 返回 `Err` 时自动降级为无界面安装 ——
+  解载荷 → 跑 `install.ps1` → 原生 `MessageBoxW` 报结果 → 删安装包自己 → 拉起客户端。
+  安装动作本来就不需要窗口，「能不能画窗口」不该决定「能不能安装」。
+- `install_payload(base, prepared)`：窗口路径与无界面路径**共用一处安装实现**
+  （此前这段逻辑内联在 `SetupApp` 的安装线程里），不会出现「改了 GUI 那条、忘了无界面那条」。
+- 反馈只用 Win32 原生提示框（不依赖 OpenGL）—— 这类机器上它是唯一还弹得出来的东西。
+- 成功提示按 `SESSIONNAME` 归因：`RDP-` 开头 → 提示**在这台电脑上重跑一次**
+  （远程桌面下界面永远起不来）；否则 → 提示**补装显卡驱动**。
+  这两种情况用户该做的事正好相反，所以必须分开说。
+- 新增 `--silent` / `--no-gui`：实施人员可显式指定无界面安装（远程 / 无人值守）。
+
+**顺带修掉一个从来没生效过的收尾动作**：`remove_self_after_exit()`（装完删掉安装包自己）
+一直没成功过。`Command::args(["/c", script])` 会给含空格的参数自动加外层引号、并把内部的
+`"` 转义成 `\"`，而 `cmd.exe` 不认这种转义 —— `del` 拿到的是坏路径；错误又被 `let _ =`
+丢弃，于是静默失败。改用 `CommandExt::raw_arg`（原样传递、不做转义）后实测生效：
+修复前安装包原地不动，修复后延迟几秒即被删除。
+
+**试过又放弃的方案**：先写了一个配套的 PowerShell 脚本（`--extract-only` + `install.ps1`）。
+两条理由否掉：客户不会执行 PowerShell；更要紧的是客户机常被组策略限制脚本执行，
+`-ExecutionPolicy Bypass` 会被组策略盖掉 —— 这与当初把更新器做成原生 exe、不做脚本是同一个原因。
+
+**当时没解决的部分**：装完之后主控台界面在这类机器上仍然打不开（同一个 OpenGL 问题）。
+当天下午用「随包带一份软件 OpenGL」补上了，见下一节。
+
+### 2026-10-12（下午：软件 OpenGL —— 任何机器都开得出窗口；自启不再拦安装）
+
+接上一节：那条「没解决的部分」——主控台窗口在只有 OpenGL 1.1 的机器上（**远程桌面**，或
+**显卡驱动没装全**）打不开 —— 当天下午解决了。同一个下午还修掉了另一颗雷：客户机的
+「开机自启项」写不进去时，安装被当成**必须项**拦掉，整台机器一个文件都装不上。
+
+#### 一、软件 OpenGL：随包带一份 Mesa（llvmpipe）
+
+**思路**：界面框架要 OpenGL 2.0+，而机器只给 1.1 —— 那就别跟显卡要，**把渲染搬到 CPU**。
+随包带一份纯软件的 OpenGL（Mesa 的 llvmpipe 后端），装进安装目录，Windows 会优先用它们
+（应用本地装配，与 `vcruntime140.dll` 同一套做法）。
+
+| 位置 | 改动 |
+| --- | --- |
+| `src/tools/swgl/` | **新增**：`opengl32.dll`、`libgallium_wgl.dll`、`msvcp140.dll`、`vcruntime140.dll`、`vcruntime140_1.dll`（Mesa 26.2.4 / llvmpipe，x64） |
+| `src/pack/main.rs` | 这 5 个文件进载荷的 `tools/swgl/`；载荷 40MB → 64MB，单文件安装程序 47.8MB → 71.9MB |
+| `install.ps1` | 铺到**安装目录**（也就是 `aicrm-console.exe` 旁边）。缺文件不拦安装 |
+| `src/forckend/console.rs` | 进程起来第一件事就置 `GALLIUM_DRIVER=llvmpipe` + `LIBGL_ALWAYS_SOFTWARE=1` |
+
+**最后那条是必须的，不是保险**：实测少设这两个变量时，Mesa 会去找硬件驱动并**当场失败**
+（进程秒退、无日志）；设上之后窗口正常创建。
+
+**实测**：把新的 `aicrm-console.exe` 与这 5 个 DLL 放在同一个目录，**不设任何外部环境变量**
+启动 —— 窗口正常创建（标题 `AICRM`），并且核对过进程加载的 `OPENGL32.dll` /
+`libgallium_wgl.dll` 确实来自该目录，而不是 `C:\Windows\System32`。
+
+**代价与边界**：
+
+- 客户端界面改走 **CPU 软件渲染**。状态窗口只在画面变化时重绘，实际基本无感；换来的是
+  远程桌面 / 无驱动机器上窗口一定能开。
+- 包体 **+24MB**（就是 `libgallium_wgl.dll` 那一个 61.8MB 的文件）。
+- **安装器本身仍是单文件 GUI**，在只有 1.1 的机器上照旧走「无界面安装」（它没法给自己旁挂
+  DLL）—— 但装完之后客户端窗口一定能开，这正是客户要的结果。
+
+**构建前提**：`src/tools/swgl/` 沿用「载荷二进制不进 Git」的规矩（同 `AICRM-Key.exe`）。
+从干净仓库构建安装程序前，要先把这 5 个文件放到位，否则 `aicrm-pack` 会直接报「读不到」。
+来源：`mesa-dist-win` 的 `mesa3d-<版本>-release-msvc.7z`，取其中的 `x64\` 那几个文件；
+`msvcp140.dll` / `vcruntime140*.dll` 取自本机 `System32`（Mesa 的 DLL 是 MSVC 动态链接的）。
+
+#### 二、开机自启：从「必须项」降为「提醒项」，并加启动文件夹兜底
+
+**背景**：客户的 Win10 机器上，环境准备第 4 项 `开机自启可注册` 失败，报
+`尝试执行未经授权的操作`（写 `HKCU\...\Run` 被拒 —— 安全软件锁启动项 / 域策略 / 受限账户
+都可能）。这一项当时是 `required`，脚本 `throw`，**整个安装当场终止**。
+
+**改法**（`install.ps1`）：
+
+- 该检查从 `required` 降为 **`advisory`**：写不进自启项只影响「开机自动起来」，客户手动双击
+  桌面图标照样能用（主窗口打开时会自己把后台服务拉起来），不该拦安装。
+- **两级兜底**：先试 `HKCU Run`；写不进就退到**启动文件夹快捷方式**
+  （`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\`，放 `AICRM.lnk` 与
+  `AICRM-Windows-API.lnk`）——启动文件夹基本不受「启动项」策略和安全软件影响。
+- **结尾那两处 `Set-ItemProperty` 也包进了 `try/catch`**。这点容易漏：只改检查不改这里，
+  脚本跑到底还是会在同一处抛错，而开头是 `$ErrorActionPreference='Stop'`，安装照样断。
+- 收尾如实报告自启落在哪里（`HKCU Run` / `启动文件夹（路径）` / 未注册），不再假装成功。
+
+**实测**：本机跑 `install.ps1 -CheckOnly` 输出 `CHECK|advisory|开机自启|pass|HKCU Run`、退出码 0；
+再故意把 `$runKey` 指向一个写不进去的位置，`Get-AutostartKind` 返回 `startup-folder` 并按预期
+生成了两条快捷方式。
 
 ### 2026-10-10（重构：去重复 · 合并登录窗 · 零参数化 · 删除死接口）
 

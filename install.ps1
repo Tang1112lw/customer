@@ -105,6 +105,46 @@ function Add-Preflight([string]$level, [string]$title, [bool]$passed, [string]$d
     Write-Output ("CHECK|{0}|{1}|{2}|{3}" -f $level, $title, $status, $detail)
 }
 
+# 开机自启的两种落点：优先注册表 HKCU Run；写不进就退到「启动文件夹」快捷方式。
+# 启动文件夹在 %APPDATA% 下，基本不受「启动项」策略与安全软件影响，是可靠的兜底。
+$script:StartupFolder = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup'
+
+# 探测本机能用哪种自启方式，返回 'run' / 'startup-folder' / ''（都不行）。
+# 只探测、不写真实自启项 —— 环境准备阶段不该动到真实配置。
+function Get-AutostartKind {
+    try {
+        New-Item -Path $runKey -Force -ErrorAction Stop | Out-Null
+        Set-ItemProperty -Path $runKey -Name 'AICRM-PreflightProbe' -Value 'probe' -ErrorAction Stop
+        Remove-ItemProperty -Path $runKey -Name 'AICRM-PreflightProbe' -Force -ErrorAction Stop
+        return 'run'
+    }
+    catch { }
+    try {
+        if (-not (Test-Path -LiteralPath $script:StartupFolder)) {
+            New-Item -ItemType Directory -Force -Path $script:StartupFolder -ErrorAction Stop | Out-Null
+        }
+        $probe = Join-Path $script:StartupFolder '.aicrm-write-probe'
+        [IO.File]::WriteAllText($probe, 'ok')
+        Remove-Item -LiteralPath $probe -Force -ErrorAction Stop
+        return 'startup-folder'
+    }
+    catch { }
+    return ''
+}
+
+# 在启动文件夹里放一条快捷方式。HKCU Run 不可用时靠它实现开机自启。
+function New-StartupShortcut([string]$name, [string]$target, [string]$arguments) {
+    $linkPath = Join-Path $script:StartupFolder $name
+    $shell = New-Object -ComObject WScript.Shell
+    $link = $shell.CreateShortcut($linkPath)
+    $link.TargetPath = $target
+    if ($arguments) { $link.Arguments = $arguments }
+    $link.WorkingDirectory = $InstallDir
+    $link.IconLocation = "$target,0"
+    $link.Description = 'AICRM'
+    $link.Save()
+}
+
 function Invoke-Preflight {
     # 1) 系统版本：Win10 1809 / Server 2019（内部版本 17763）起步 —— 再早的系统上
     #    托盘、长路径、TLS 都会出问题，与其装完再猜，不如当场说清楚。
@@ -137,16 +177,17 @@ function Invoke-Preflight {
         Add-Preflight 'required' '安装目录可写' $false "$InstallDir（$($_.Exception.Message)）"
     }
 
-    # 4) 开机自启项可写
-    try {
-        New-Item -Path $runKey -Force | Out-Null
-        Set-ItemProperty -Path $runKey -Name 'AICRM-PreflightProbe' -Value 'probe'
-        Remove-ItemProperty -Path $runKey -Name 'AICRM-PreflightProbe' -Force
-        Add-Preflight 'required' '开机自启可注册' $true 'HKCU Run'
-    }
-    catch {
-        Add-Preflight 'required' '开机自启可注册' $false $_.Exception.Message
-    }
+    # 4) 开机自启可写。**只提醒，不拦**：写不进自启项只影响「开机自动起来」，
+    #    客户手动双击桌面图标照样能用（主窗口打开时会自己把后台服务拉起来）。
+    #    而有些机器（安全软件锁启动项 / 域策略 / 受限账户）根本写不进 HKCU Run，
+    #    以前把这一项当「必须」，结果整台机器装不上 —— 代价和收益完全不成比例。
+    #    两种方式都试：HKCU Run → 启动文件夹快捷方式。
+    $script:AutostartKind = Get-AutostartKind
+    Add-Preflight 'advisory' '开机自启' ($script:AutostartKind -ne '') $(
+        if ($script:AutostartKind -eq 'run') { 'HKCU Run' }
+        elseif ($script:AutostartKind -eq 'startup-folder') { "启动文件夹：$script:StartupFolder" }
+        else { 'HKCU Run 与启动文件夹都写不进；不影响安装，从桌面图标手动启动即可' }
+    )
 
     # 5) VC++ 运行库：第三方程序（AICRM-Key.exe / aicrm-export-new.exe）改不了链接
     #    方式，只能在 exe 同目录放一份（应用本地装配）。随包带一份，本机装了也行。
@@ -271,6 +312,22 @@ Copy-Item -LiteralPath $ExportProgram -Destination (Join-Path $tools 'aicrm-expo
 Copy-Item -LiteralPath $script:CrtSource -Destination (Join-Path $tools 'vcruntime140.dll') -Force
 Copy-Item -LiteralPath $script:CrtSource -Destination (Join-Path $InstallDir 'vcruntime140.dll') -Force
 
+# ---- 软件 OpenGL（Mesa llvmpipe）----
+# 远程桌面会话、或没装显卡驱动的机器，本机只给到 OpenGL 1.1；界面框架要求 2.0+，
+# 客户端窗口会建不出来（客户看到的就是"双击没反应 / 窗口打不开"）。把这一组 DLL
+# 放到**安装目录**（也就是 aicrm-console.exe 旁边，应用本地装配），Windows 会优先
+# 用它们，客户端就走纯软件渲染 —— 任何机器上窗口都能开。
+# 缺文件不拦安装：真缺了，客户端还有原生提示框把原因说清楚，不会静默失败。
+$swglSource = Join-Path $ToolSource 'swgl'
+if (Test-Path -LiteralPath $swglSource -PathType Container) {
+    foreach ($name in @('opengl32.dll', 'libgallium_wgl.dll', 'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
+        $from = Join-Path $swglSource $name
+        if (Test-Path -LiteralPath $from -PathType Leaf) {
+            Copy-Item -LiteralPath $from -Destination (Join-Path $InstallDir $name) -Force
+        }
+    }
+}
+
 # 本地 API 的 Bearer token（安装时生成一次，之后不换）
 if (-not (Test-Path -LiteralPath $tokenFile)) {
     $token = New-HexToken
@@ -339,17 +396,44 @@ if ($AllowOrigin) {
         if ($origin.Trim()) { $extraArguments += ' --allow-origin "{0}"' -f $origin.Trim() }
     }
 }
-New-Item -Path $runKey -Force | Out-Null
-Set-ItemProperty -Path $runKey -Name 'AICRM-Windows-API' -Value ('"{0}"{1}' -f $exe, $extraArguments)
-if ($extraArguments) {
-    Start-Process -FilePath $exe -ArgumentList $extraArguments.Trim() -WorkingDirectory $InstallDir -WindowStyle Hidden
+# 自启落点：HKCU Run 能写就写 Run，写不进就退到启动文件夹（放两条快捷方式）。
+# 关键：**任何一步失败都不许中断安装** —— 以前这里 Set-ItemProperty 抛错会顺着
+# $ErrorActionPreference='Stop' 直接把整个安装打断，客户什么都得不到。
+$apiArgs = $extraArguments.Trim()
+$autostartWhere = ''
+try {
+    if ($script:AutostartKind -eq 'startup-folder') {
+        throw 'HKCU Run 不可写，改用启动文件夹'
+    }
+    New-Item -Path $runKey -Force -ErrorAction Stop | Out-Null
+    Set-ItemProperty -Path $runKey -Name 'AICRM-Windows-API' -Value ('"{0}"{1}' -f $exe, $extraArguments) -ErrorAction Stop
+    Set-ItemProperty -Path $runKey -Name 'AICRM-客户端' -Value ('"{0}" --hidden' -f $consoleExe) -ErrorAction Stop
+    $autostartWhere = 'HKCU Run'
+}
+catch {
+    try {
+        if (-not (Test-Path -LiteralPath $script:StartupFolder)) {
+            New-Item -ItemType Directory -Force -Path $script:StartupFolder | Out-Null
+        }
+        New-StartupShortcut 'AICRM-Windows-API.lnk' $exe $apiArgs
+        New-StartupShortcut 'AICRM.lnk' $consoleExe '--hidden'
+        $autostartWhere = "启动文件夹（$script:StartupFolder）"
+    }
+    catch {
+        Write-Warning "注册开机自启失败（不影响本次安装）：$_"
+        $autostartWhere = ''
+    }
+}
+
+# 立即把后台服务拉起来（不管自启注册成功与否 —— 装了就要能用）。
+if ($apiArgs) {
+    Start-Process -FilePath $exe -ArgumentList $apiArgs -WorkingDirectory $InstallDir -WindowStyle Hidden
 } else {
     Start-Process -FilePath $exe -WorkingDirectory $InstallDir -WindowStyle Hidden
 }
 
 # 主窗口自带通知区托盘（同一个进程），开机只静默进托盘，不弹窗口打扰客户。
-Set-ItemProperty -Path $runKey -Name 'AICRM-客户端' -Value ('"{0}" --hidden' -f $consoleExe)
-# 但装完这一次要弹出来，不然客户不知道装了什么
+# 但装完这一次要弹出来，不然客户不知道装了什么。
 Start-Process -FilePath $consoleExe -WorkingDirectory $InstallDir
 
 # ---- 快捷方式：桌面 + 开始菜单，客户唯一需要认识的入口 ----
@@ -372,7 +456,11 @@ if (-not $ready) { throw "启动项已写入，但接口未在 $Bind 就绪；�
 
 Write-Output ''
 Write-Output "AICRM Windows API 已安装并启动：$Bind"
-Write-Output "开机登录自启：HKCU Run\AICRM-Windows-API"
+if ($autostartWhere) {
+    Write-Output "开机自启：$autostartWhere"
+} else {
+    Write-Output '开机自启：未注册（从桌面图标手动启动即可，不影响采集与上传）'
+}
 Write-Output "密钥目录：$KeyDir"
 Write-Output "本地 API token：$tokenFile"
 Write-Output "主窗口：$consoleExe"

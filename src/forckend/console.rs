@@ -60,6 +60,15 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const REFRESH: Duration = Duration::from_secs(5);
 
 fn main() {
+    // 随包的软件 OpenGL（Mesa）就在安装目录里（应用本地装配，见 install.ps1）。
+    // 这里指定 llvmpipe 后端：少了这一条，Mesa 会去找硬件驱动并当场失败；有了它，
+    // 远程桌面会话 / 没装显卡驱动的机器（本机只给 OpenGL 1.1）也能正常打开窗口 ——
+    // 界面框架要求 OpenGL 2.0+，硬件给不了，就用纯软件渲染顶上。
+    // SAFETY: 这是进程里执行的第一段代码，还没有其它线程会并发读写环境变量。
+    unsafe {
+        std::env::set_var("GALLIUM_DRIVER", "llvmpipe");
+        std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
+    }
     let log = console_error_log();
     // 界面是 GUI：出错时没有控制台可看，静默退出就是"双击没反应"。
     // 先装兜底（panic 也算），再把启动失败报出来。
