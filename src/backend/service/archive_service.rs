@@ -3,24 +3,38 @@
 //! 「数据采集」闭环的上半段：客户端把聊天记录导成 Markdown，打包上传给云端。
 //!
 //! 只跑一个导出程序 `aicrm-export-new.exe`，它产出
-//! `<wxid>/<联系人>/<日期>/messages.md`。云端把这份 Markdown 原样存盘、原样交给
-//! Hermes 智能体分析（AI 输入格式 `aicrm-analysis-input/v3`），全链路一种格式：
-//! 人工阅读用的和 AI 分析用的是同一份数据，不再有 JSON 中转。
+//! `<wxid>/<联系人>/<日期>/messages.md`，同一天的语音则落在 `<日期>/audio/*.silk`，
+//! Markdown 里的 `[语音](audio/xxx.silk)` 就指向这些文件。云端把这份 Markdown
+//! 原样存盘、原样交给 Hermes 智能体分析（AI 输入格式 `aicrm-analysis-input/v3`），
+//! 全链路一种格式：人工阅读用的和 AI 分析用的是同一份数据，不再有 JSON 中转。
 //!
 //! 归档包格式（云端 `archive.go` 的 `markdownBundle`）：
 //!
 //! ```json
 //! {
-//!   "schema_version": "aicrm-chat-archive/v2",
+//!   "schema_version": "aicrm-chat-archive/v3",
 //!   "task_id": "<uuid>",
 //!   "bootstrap": false,
 //!   "exports": [{
 //!     "chat": {"id": "…", "display_name": "…", "type": "contact"},
 //!     "date_range": {"start": "2026-10-07", "end": "2026-10-09"},
-//!     "days": [{"date": "2026-10-09", "message_count": 12, "markdown": "# 2026-10-09\n\n- **我**：…"}]
+//!     "days": [{
+//!       "date": "2026-10-09",
+//!       "message_count": 12,
+//!       "markdown": "# 2026-10-09\n\n- **我**：…",
+//!       "media": [{
+//!         "path": "audio/1_voice_1.silk",
+//!         "size": 12345,
+//!         "sha256": "…",
+//!         "content_base64": "…"
+//!       }]
+//!     }]
 //!   }]
 //! }
 //! ```
+//!
+//! `media[].path` 相对当天的日期目录，与 Markdown 里的 `](audio/…)` 链接同源：
+//! 云端按 `<会话>/<日期>/<path>` 原样落盘，链接不用改写就仍然指得到文件。
 //!
 //! 会话 ID 取导出目录里的会话文件夹名：群聊是 `xxx@chatroom`，单聊是联系人名。
 //! Markdown 里没有消息 ID，云端的分析去重因此按天（`day:YYYY-MM-DD`）记账。
@@ -29,13 +43,68 @@ use super::{ApiError, ApiResult, Service, option, state_service::UPLOADED, today
 use crate::backend::service::run_blocking;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, fs, path::Path, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 /// 导出程序：产 `messages.md`，云端归档与 AI 分析都用它。
 pub(crate) const ARCHIVE_PROGRAM: &str = super::export_service::EXPORT_PROGRAM;
 
 /// 归档包 schema 版本，必须与云端 `archive.go` 的 `archiveSchemaVersion` 一致。
-const ARCHIVE_SCHEMA: &str = "aicrm-chat-archive/v2";
+///
+/// v2 → v3：`days[]` 多带一个 `media`，把导出程序产在日期目录里的语音文件一起上传。
+/// **两端必须同时升**：云端只认写死的那个版本号，客户端单方面升上去只会得到
+/// 「schema_version 必须是 aicrm-chat-archive/v3」的 400，一次采集都发不出去。
+const ARCHIVE_SCHEMA: &str = "aicrm-chat-archive/v3";
+
+/// 单个媒体文件的大小上限（16MB）。
+///
+/// 微信语音实测 1KB–62KB，这是 250 倍以上的余量。超限的文件跳过并记日志，不让它
+/// 进包：一个异常大的文件足以让 `serde_json::to_vec` 把内存吃光、或顶穿云端的
+/// 请求体上限（`MAX_UPLOAD_BYTES` 默认 128MB，Base64 还要再涨三分之一），
+/// 那会让**整包**归档失败；少一个文件只是那一条语音变成死链，代价小一个数量级。
+const MAX_MEDIA_FILE_BYTES: u64 = 16 << 20;
+
+/// **一天**的媒体总量上限（48MB）。
+///
+/// 单文件上限挡不住"一天攒很多"：导出程序除了语音还会往日期目录里放图片视频
+/// （`images/*.dat`、`videos/*.mp4`、`files/`），一个带视频的日子 Base64 后就能
+/// 顶穿云端请求体上限（`MAX_UPLOAD_BYTES` 默认 128MB，Base64 再涨三分之一），
+/// 那会让**整包**归档失败 —— 一天的文字全部发不出去。超限后当天剩余媒体跳过
+/// （文字照发，语音死链比整包丢失轻），并记日志说清跳过原因。
+/// 实测全量微信语音约 20MB/账号，这个预算远在正常用量之上。
+const MAX_DAY_MEDIA_BYTES: u64 = 48 << 20;
+
+/// **整包**的媒体总量上限（64MB）。
+///
+/// 单文件与单天的闸都管不住"很多天"：一次采集动辄覆盖十来天，每天 48MB 就是
+/// 近五百兆，Base64 后远超云端请求体上限（`MAX_UPLOAD_BYTES` 默认 128MB）——
+/// 结果是整包上传失败，十多天的文字一起发不出去。所以第三道闸按包算：
+/// 到顶后剩余媒体跳过（文字照发），并记日志说清跳过原因。
+/// 64MB Base64 后约 85MB，加上 Markdown 与 JSON 结构仍在 128MB 之内有余量。
+const MAX_BUNDLE_MEDIA_BYTES: u64 = 64 << 20;
+
+/// 一天的媒体文件在归档包里的样子。
+///
+/// `path` 相对当天的日期目录（如 `audio/1_voice_1.silk`），且**一律用 `/` 分隔**：
+/// Windows 上 `Path` 的显示是 `\`，而 Markdown 链接里写的是 `/`，两边必须一致，
+/// 云端才能按 `<会话>/<日期>/<path>` 落盘并让链接继续有效。
+/// `sha256` 让云端校验完整性，也便于同一天重复上传时判断内容有没有变。
+struct MediaEntry {
+    path: String,
+    size: u64,
+    sha256: String,
+    content_base64: String,
+}
+
+/// 一天的归档内容：Markdown 正文加这一天的媒体文件。
+struct DayPayload {
+    markdown: String,
+    media: Vec<MediaEntry>,
+}
 
 /// 导出超时。聊天库大时这个程序会跑很久。
 // 必须小于云端僵尸任务阈值（backend/internal/aicrm/cleanup: StaleTaskTimeout=15 分钟），
@@ -151,12 +220,12 @@ impl Service {
         // 现在一份 Markdown 同时满足人工查阅与 AI 分析。
         // 导出失败同样要回报云端（理由见上面的前置检查）。
         if let Err(error) = self.run_archive_program(ARCHIVE_PROGRAM, &work, &request).await {
-            report_task_failure(&request, &error.message());
+            report_task_failure(&request, error.message());
             return Err(error);
         }
         let _ = work; // 导出程序把结果写进 work，云端按会话/日期拆开
 
-        // ② 收集所有 messages.json，合并成一个归档包
+        // ② 收集所有 messages.md 与同目录的媒体文件，合并成一个归档包
         // 归档打包失败同样回报（理由见上面的前置检查）。
         let bundle = tokio::task::spawn_blocking({
             let root = work.clone();
@@ -178,11 +247,20 @@ impl Service {
             .and_then(|value| value.as_array())
             .map(|items| items.len())
             .unwrap_or(0);
+        let media_count = archive_media_count(&bundle);
         report_task_progress(
             &request,
             "exporting",
             35,
-            &format!("导出完成，已打包 {conversation_count} 个会话，准备上传"),
+            // 语音数单独报：v3 起它会实打实占上传体积，看不到这个数，
+            // 上传变慢时只能猜是不是网断了。
+            &if media_count > 0 {
+                format!(
+                    "导出完成，已打包 {conversation_count} 个会话、{media_count} 个语音文件，准备上传"
+                )
+            } else {
+                format!("导出完成，已打包 {conversation_count} 个会话，准备上传")
+            },
         );
 
         // ③ 上传
@@ -227,11 +305,11 @@ impl Service {
             }
             Err(error) => {
                 self.state
-                    .mark_upload(&request.task_id, false, &error.message(), "", "");
+                    .mark_upload(&request.task_id, false, error.message(), "", "");
                 // 失败了必须告诉云端。采集是在后台任务里跑的，浏览器早就不再等那个
                 // 请求 —— 不上报，任务就一直停在 created，网页永远显示"采集中"，
                 // 只能干等僵尸任务清理（15 分钟）把它放开。
-                report_task_failure(&request, &error.message());
+                report_task_failure(&request, error.message());
             }
         }
 
@@ -269,13 +347,16 @@ impl Service {
     }
 }
 
-/// 把导出目录里的 `messages.md` 合并成一个 `aicrm-chat-archive/v2` 包。
+/// 把导出目录里的 `messages.md` 与同目录的媒体文件合并成一个
+/// `aicrm-chat-archive/v3` 包。
 ///
-/// 目录结构由导出程序决定：`<导出目录>/<wxid>/<会话>/<YYYY-MM-DD>/messages.md`。
-/// 会话文件夹名就是会话标识（群聊为 `xxx@chatroom`，单聊为联系人名），云端按它分会话。
+/// 目录结构由导出程序决定：`<导出目录>/<wxid>/<会话>/<YYYY-MM-DD>/messages.md`，
+/// 语音在同级的 `audio/` 下。会话文件夹名就是会话标识（群聊为 `xxx@chatroom`，
+/// 单聊为联系人名），云端按它分会话。
 fn build_archive(root: &Path, task_id: &str) -> Result<Value, String> {
-    let mut conversations: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-    collect_days(root, &mut conversations)?;
+    let mut conversations: BTreeMap<String, BTreeMap<String, DayPayload>> = BTreeMap::new();
+    let mut bundle_bytes: u64 = 0;
+    collect_days(root, &mut conversations, &mut bundle_bytes)?;
     if conversations.is_empty() {
         return Err(format!(
             "导出目录里没有找到任何 messages.md：{}（导出程序可能没产出数据）",
@@ -291,11 +372,25 @@ fn build_archive(root: &Path, task_id: &str) -> Result<Value, String> {
             let end = dates.last().cloned().unwrap_or_default();
             let day_values: Vec<Value> = days
                 .into_iter()
-                .map(|(date, markdown)| {
+                .map(|(date, payload)| {
+                    let DayPayload { markdown, media } = payload;
+                    let message_count = count_markdown_messages(&markdown);
+                    let media_values: Vec<Value> = media
+                        .iter()
+                        .map(|entry| {
+                            json!({
+                                "path": entry.path,
+                                "size": entry.size,
+                                "sha256": entry.sha256,
+                                "content_base64": entry.content_base64,
+                            })
+                        })
+                        .collect();
                     json!({
                         "date": date,
-                        "message_count": count_markdown_messages(&markdown),
+                        "message_count": message_count,
                         "markdown": markdown,
+                        "media": media_values,
                     })
                 })
                 .collect();
@@ -321,7 +416,8 @@ fn build_archive(root: &Path, task_id: &str) -> Result<Value, String> {
     }))
 }
 
-/// 递归收集目录树里的 `<会话>/<日期>/messages.md`，按会话分组放回 `out`。
+/// 递归收集目录树里的 `<会话>/<日期>/messages.md`，按会话分组放回 `out`；
+/// 同一天的媒体文件一并收进当天的 [`DayPayload`]。
 ///
 /// 不能假设"导出目录下第一个子目录就是账号层"：导出程序会在同一层并排放
 /// `.locks` 这类内部目录，靠名字猜或靠遍历顺序取第一个，命中与否全看运气。
@@ -329,11 +425,16 @@ fn build_archive(root: &Path, task_id: &str) -> Result<Value, String> {
 /// 旁边的 `<wxid>/<会话>/<日期>/messages.md` 里。所以改成按**结构特征**识别：
 /// 目录名是日期且里面有 `messages.md`，就是一个有效日期；其余向下继续钻。
 /// 以点开头的目录一律跳过（它们是程序的内部产物，不是聊天数据）。
+///
+/// `bundle_bytes` 是整包媒体预算的累计值（见 [`MAX_BUNDLE_MEDIA_BYTES`]），
+/// 由调用方持有、在这里跨天累加：它决定了后面的日期还能不能收媒体。
 fn collect_days(
     dir: &Path,
-    out: &mut BTreeMap<String, BTreeMap<String, String>>,
+    out: &mut BTreeMap<String, BTreeMap<String, DayPayload>>,
+    bundle_bytes: &mut u64,
 ) -> Result<(), String> {
-    let entries = fs::read_dir(dir).map_err(|error| format!("读取 {} 失败：{error}", dir.display()))?;
+    let entries =
+        fs::read_dir(dir).map_err(|error| format!("读取 {} 失败：{error}", dir.display()))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -361,12 +462,121 @@ fn collect_days(
                 .and_then(|value| value.to_str())
                 .unwrap_or("未知会话")
                 .to_string();
+            let media = collect_media(&path, bundle_bytes)?;
             out.entry(conversation)
                 .or_default()
-                .insert(name.to_string(), markdown);
+                .insert(name.to_string(), DayPayload { markdown, media });
             continue;
         }
-        collect_days(&path, out)?;
+        collect_days(&path, out, bundle_bytes)?;
+    }
+    Ok(())
+}
+
+/// 收集一个日期目录里的媒体文件：除 `messages.md` 与 `messages.json` 之外的全部文件。
+///
+/// 递归而不是只认 `audio/`：导出程序今天把语音放在 `audio/`，以后加图片、视频也会是
+/// 新目录；按「除正文外都要」来收，就不用每加一种媒体改一次这里。反过来，漏收的
+/// 代价是 Markdown 里的链接变成死链，云端拿不到文件、语音转写无从谈起。
+///
+/// 三个上限各自管一件事：[`MAX_MEDIA_FILE_BYTES`] 挡单个异常大的文件，
+/// [`MAX_DAY_MEDIA_BYTES`] 挡「一天攒太多」，[`MAX_BUNDLE_MEDIA_BYTES`]
+/// （经 `bundle_bytes` 累计）挡「很多天攒更多」—— 后两者到顶就当天/整包收手，
+/// 文字照发。顺序敏感：先量后读，读到内存里再判断就已经晚了。
+/// 返回的条目按路径排序，让同一批文件每次打包出来的包字节一致，便于比对与复现。
+fn collect_media(day_dir: &Path, bundle_bytes: &mut u64) -> Result<Vec<MediaEntry>, String> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    walk_media_files(day_dir, &mut files)?;
+    files.sort();
+
+    let mut entries: Vec<MediaEntry> = Vec::with_capacity(files.len());
+    let mut day_bytes: u64 = 0;
+    for file in &files {
+        let relative = file
+            .strip_prefix(day_dir)
+            .map_err(|_| format!("媒体文件不在日期目录内：{}", file.display()))?;
+        // 相对路径一律用 `/`：Windows 上是 `\`，而 Markdown 链接里写的是 `/`。
+        let path = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        // 先看大小再读内容：否则一个异常大的文件会先被整个读进内存，跳过就失去意义了。
+        let size = fs::metadata(file)
+            .map_err(|error| format!("读取 {} 失败：{error}", file.display()))?
+            .len();
+        if size > MAX_MEDIA_FILE_BYTES {
+            eprintln!(
+                "归档跳过超大媒体文件 {}（{} 字节，上限 {} 字节）",
+                file.display(),
+                size,
+                MAX_MEDIA_FILE_BYTES
+            );
+            continue;
+        }
+        if day_bytes + size > MAX_DAY_MEDIA_BYTES {
+            eprintln!(
+                "归档跳过媒体文件 {}：当天媒体总量已达 {} 字节（上限 {} 字节），当天文字仍会照常上传",
+                file.display(),
+                day_bytes,
+                MAX_DAY_MEDIA_BYTES
+            );
+            continue;
+        }
+        if *bundle_bytes + size > MAX_BUNDLE_MEDIA_BYTES {
+            eprintln!(
+                "归档跳过媒体文件 {}：整包媒体总量已达 {} 字节（上限 {} 字节），后续日期的文字仍会照常上传",
+                file.display(),
+                *bundle_bytes,
+                MAX_BUNDLE_MEDIA_BYTES
+            );
+            continue;
+        }
+        let bytes =
+            fs::read(file).map_err(|error| format!("读取 {} 失败：{error}", file.display()))?;
+        // 读完之后再核一次：导出目录是我们自己刚产出的，但"元数据说小、内容变大"
+        // 这种竞态不该让整包上传失败。
+        if bytes.len() as u64 > MAX_MEDIA_FILE_BYTES {
+            eprintln!(
+                "归档跳过超大媒体文件 {}（{} 字节，上限 {} 字节）",
+                file.display(),
+                bytes.len(),
+                MAX_MEDIA_FILE_BYTES
+            );
+            continue;
+        }
+        day_bytes += bytes.len() as u64;
+        *bundle_bytes += bytes.len() as u64;
+        entries.push(MediaEntry {
+            path,
+            size: bytes.len() as u64,
+            sha256: crate::backend::sha256::hex_digest(&bytes),
+            content_base64: crate::backend::base64::encode(&bytes),
+        });
+    }
+    Ok(entries)
+}
+
+/// 递归枚举 `dir` 下的文件，跳过目录、隐藏文件和两种已知的正文/中间产物。
+fn walk_media_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries =
+        fs::read_dir(dir).map_err(|error| format!("读取 {} 失败：{error}", dir.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_media_files(&path, out)?;
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        // messages.md 已经在 markdown 字段里；messages.json 是导出程序的中间格式，
+        // 云端自 v2 起就不收 JSON 了，带上去只是白占带宽。
+        // 以点开头的是内部产物，与 collect_days 的判断保持一致。
+        if name.starts_with('.') || name == "messages.md" || name == "messages.json" {
+            continue;
+        }
+        out.push(path);
     }
     Ok(())
 }
@@ -388,6 +598,26 @@ fn count_markdown_messages(markdown: &str) -> usize {
         .lines()
         .filter(|line| line.trim_start().starts_with("- "))
         .count()
+}
+
+/// 数归档包里的媒体文件总数，只用于往进度消息里报一个数。
+///
+/// 结构不对时返回 0 而不是报错：这只是给人看的诊断信息，包是 `build_archive` 刚产出来的，
+/// 形状由那个函数自己保证，出错也只可能是编程错误，不该在汇报时再把采集打断。
+fn archive_media_count(bundle: &Value) -> usize {
+    bundle
+        .get("exports")
+        .and_then(Value::as_array)
+        .map(|exports| {
+            exports
+                .iter()
+                .filter_map(|export| export.get("days").and_then(Value::as_array))
+                .flatten()
+                .filter_map(|day| day.get("media").and_then(Value::as_array))
+                .map(|media| media.len())
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 /// 上报一次采集进度。
@@ -514,11 +744,16 @@ mod tests {
     fn archive_bundle_matches_cloud_schema() {
         let dir = tempfile::tempdir().unwrap();
         let chat = dir.path().join("wxid_demo").join("张三").join("2026-10-05");
-        fs::create_dir_all(&chat).unwrap();
-        fs::write(chat.join("messages.md"), "- **张三** 10:01:00：你好\n").unwrap();
-        // JSON 与媒体文件都不该被收进归档
+        fs::create_dir_all(chat.join("audio")).unwrap();
+        fs::write(
+            chat.join("messages.md"),
+            "- **张三** 10:01:00：你好\n- **张三** 10:02:00：[语音](audio/1_voice_1.silk)\n",
+        )
+        .unwrap();
+        // 导出程序的中间产物与语音并排放：只有后者该进归档
         fs::write(chat.join("messages.json"), r#"{"messages":[]}"#).unwrap();
-        fs::write(chat.join("voice.silk"), b"x").unwrap();
+        let voice = b"\x02#SILK\x03voice-bytes";
+        fs::write(chat.join("audio").join("1_voice_1.silk"), voice).unwrap();
 
         let bundle = build_archive(dir.path(), "task-1").unwrap();
         assert_eq!(bundle["schema_version"], ARCHIVE_SCHEMA);
@@ -530,7 +765,166 @@ mod tests {
         assert_eq!(exports[0]["chat"]["id"], "张三");
         assert_eq!(exports[0]["chat"]["type"], "contact");
         assert_eq!(exports[0]["days"][0]["date"], "2026-10-05");
-        assert_eq!(exports[0]["days"][0]["message_count"], 1);
+        assert_eq!(exports[0]["days"][0]["message_count"], 2);
+        // v3：语音跟着当天一起走；messages.json 仍被排除在外
+        let media = exports[0]["days"][0]["media"].as_array().unwrap();
+        assert_eq!(media.len(), 1, "语音该进归档，messages.json 不该");
+        assert_eq!(media[0]["path"], "audio/1_voice_1.silk");
+        assert_eq!(media[0]["size"], voice.len() as u64);
+        assert_eq!(
+            media[0]["sha256"],
+            crate::backend::sha256::hex_digest(voice)
+        );
+        assert_eq!(
+            media[0]["content_base64"],
+            crate::backend::base64::encode(voice)
+        );
+    }
+
+    /// 回归：没有语音的那天不能报错，`media` 给空数组即可。
+    ///
+    /// 大量会话整天只有文字，若把"没有媒体"当成异常，第一次全量采集就会失败。
+    #[test]
+    fn day_without_media_carries_an_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = dir.path().join("wxid_demo").join("王五").join("2026-10-05");
+        fs::create_dir_all(&chat).unwrap();
+        fs::write(chat.join("messages.md"), "- **王五** 10:01:00：纯文字\n").unwrap();
+
+        let bundle = build_archive(dir.path(), "task-1").unwrap();
+        let media = bundle["exports"][0]["days"][0]["media"].as_array().unwrap();
+        assert!(media.is_empty(), "没有语音的天应该是空数组");
+        assert_eq!(archive_media_count(&bundle), 0);
+    }
+
+    /// 媒体路径必须用 `/` 分隔，且能钻到子目录。
+    ///
+    /// Windows 上 `Path` 的显示是 `\`，而 Markdown 链接里写的是 `/`；两边不一致，
+    /// 云端按 `](audio/…)` 找文件就会全部落空。递归则保证导出程序以后加
+    /// `image/`、`video/` 时不用改这里。
+    #[test]
+    fn media_paths_use_forward_slashes_and_recurse() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = dir.path().join("wxid_demo").join("赵六").join("2026-10-05");
+        fs::create_dir_all(chat.join("audio").join("nested")).unwrap();
+        fs::write(chat.join("messages.md"), "- **赵六** 10:01:00：在\n").unwrap();
+        fs::write(chat.join("audio").join("1_voice_1.silk"), b"silk-a").unwrap();
+        fs::write(
+            chat.join("audio").join("nested").join("2_voice_2.silk"),
+            b"silk-b",
+        )
+        .unwrap();
+
+        let bundle = build_archive(dir.path(), "task-1").unwrap();
+        let media = bundle["exports"][0]["days"][0]["media"].as_array().unwrap();
+        let paths: Vec<&str> = media
+            .iter()
+            .map(|item| item["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["audio/1_voice_1.silk", "audio/nested/2_voice_2.silk"]
+        );
+        assert_eq!(archive_media_count(&bundle), 2);
+    }
+
+    /// 超大媒体文件要跳过，但不能让整包失败。
+    ///
+    /// 真实语音只有几十 KB；这里踩的是上限本身有没有生效 —— 少了这道闸，
+    /// 一个异常文件足以顶穿云端的请求体上限，把整天的文字一起带走。
+    #[test]
+    fn oversized_media_is_skipped_without_failing_the_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = dir.path().join("wxid_demo").join("孙七").join("2026-10-05");
+        fs::create_dir_all(chat.join("audio")).unwrap();
+        fs::write(chat.join("messages.md"), "- **孙七** 10:01:00：嗨\n").unwrap();
+        fs::write(chat.join("audio").join("small.silk"), b"tiny").unwrap();
+        fs::write(
+            chat.join("audio").join("huge.silk"),
+            vec![b'x'; MAX_MEDIA_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        let bundle = build_archive(dir.path(), "task-1").unwrap();
+        let media = bundle["exports"][0]["days"][0]["media"].as_array().unwrap();
+        assert_eq!(media.len(), 1, "超限的那个必须被跳过");
+        assert_eq!(media[0]["path"], "audio/small.silk");
+    }
+
+    /// 当天总量超限时，**排在前面的**照收、后面的跳过，整包仍然成功。
+    ///
+    /// 单文件上限挡不住"一天攒很多"：带图片视频的日子 Base64 后足以顶穿云端
+    /// 请求体上限，把整天的文字一起带走。这里验证的是：到顶就收手当天剩余
+    /// 媒体，而不是整包失败。
+    #[test]
+    fn daily_media_budget_stops_at_the_cap_without_failing_the_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = dir.path().join("wxid_demo").join("周八").join("2026-10-05");
+        fs::create_dir_all(chat.join("audio")).unwrap();
+        fs::write(chat.join("messages.md"), "- **周八** 10:01:00：在
+").unwrap();
+        // 四个各 16MB 的文件：前三格合计正好 48MB 到顶，第四个超限
+        // （48 + 16 = 64 > 48）。每个都压在单文件上限内，撞的正是当天总量闸。
+        for name in ["a.silk", "b.silk", "c.silk", "d.silk"] {
+            fs::write(chat.join("audio").join(name), vec![b'x'; MAX_MEDIA_FILE_BYTES as usize]).unwrap();
+        }
+
+        let bundle = build_archive(dir.path(), "task-1").unwrap();
+        let media = bundle["exports"][0]["days"][0]["media"].as_array().unwrap();
+        let paths: Vec<&str> = media.iter().map(|item| item["path"].as_str().unwrap()).collect();
+        assert_eq!(
+            paths,
+            vec!["audio/a.silk", "audio/b.silk", "audio/c.silk"],
+            "到顶后当天剩余媒体必须跳过"
+        );
+        assert_eq!(archive_media_count(&bundle), 3);
+    }
+
+    /// 整包媒体预算：跨天累计，到顶就收手，整包仍然成功。
+    ///
+    /// 单天的闸管不住"很多天"：这次采集覆盖十来天、每天 48MB 就是近五百兆，
+    /// Base64 后远超云端 128MB 请求体上限，整包上传失败、十多天文字一起丢。
+    /// 这里验证的是第三道闸（整包 64MB）生效，且到顶后**文字照发**。
+    ///
+    /// 只断言总量不断言按天分布：`collect_days` 按 `read_dir` 顺序扫日期，
+    /// 哪天先被扫到看文件系统心情；但无论哪天先扫，整包都只收到 64MB ——
+    /// 先扫的那天吃满当天/整包预算，后扫的那天只剩一个文件的余量。
+    #[test]
+    fn bundle_media_budget_stops_at_the_cap_without_failing_the_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("wxid_demo").join("吴九").join("2026-10-01");
+        let second = dir.path().join("wxid_demo").join("吴九").join("2026-10-02");
+        fs::create_dir_all(first.join("audio")).unwrap();
+        fs::create_dir_all(second.join("audio")).unwrap();
+        fs::write(first.join("messages.md"), "- **吴九** 10:01:00：早\n").unwrap();
+        fs::write(second.join("messages.md"), "- **吴九** 10:01:00：早\n").unwrap();
+        // 两天共 6 个 16MB 文件。先扫的一天收满 64MB 里的绝大部分，后扫的一天
+        // 只剩一个文件的余量，其余跳过 —— 合起来恰好 4 个文件、64MB。
+        for day in [&first, &second] {
+            for name in ["a.silk", "b.silk", "c.silk", "d.silk"] {
+                fs::write(
+                    day.join("audio").join(name),
+                    vec![b'x'; MAX_MEDIA_FILE_BYTES as usize],
+                )
+                .unwrap();
+            }
+        }
+
+        let bundle = build_archive(dir.path(), "task-1").unwrap();
+        assert_eq!(archive_media_count(&bundle), 4, "整包到顶后剩余媒体必须跳过");
+        let collected: u64 = bundle["exports"][0]["days"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|day| day["media"].as_array().unwrap())
+            .map(|entry| entry["size"].as_u64().unwrap())
+            .sum();
+        assert_eq!(collected, MAX_BUNDLE_MEDIA_BYTES, "整包媒体总量必须停在预算线");
+        // 文字不受媒体预算影响：两天都还在
+        assert_eq!(bundle["exports"][0]["days"].as_array().unwrap().len(), 2);
+        for day in bundle["exports"][0]["days"].as_array().unwrap() {
+            assert!(day["markdown"].as_str().unwrap().contains("早"));
+        }
     }
 
     /// 回归：导出程序会在导出根下并排放 `.locks` 这类内部目录。
@@ -544,11 +938,20 @@ mod tests {
         let chat = dir.path().join("wxid_demo").join("李四").join("2026-10-06");
         fs::create_dir_all(&chat).unwrap();
         fs::write(chat.join("messages.md"), "- **李四** 10:01:00：嗨\n").unwrap();
+        // 日期目录里也可能藏点文件，同样不该被当成会话层或媒体
+        fs::write(chat.join(".partial"), b"half-written").unwrap();
 
         let bundle = build_archive(dir.path(), "task-2").unwrap();
         let exports = bundle["exports"].as_array().unwrap();
         assert_eq!(exports.len(), 1, "内部目录不能被当成会话层");
         assert_eq!(exports[0]["chat"]["id"], "李四");
+        assert!(
+            exports[0]["days"][0]["media"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "日期目录里的隐藏文件不是媒体"
+        );
     }
 
     #[test]

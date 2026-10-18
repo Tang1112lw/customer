@@ -293,8 +293,11 @@ pub fn spawn(service: std::sync::Arc<Service>, config: CloudConfig) {
 pub(crate) fn wechat_process_running() -> bool {
     // 老版是 WeChat.exe，4.x 改成 Weixin.exe，两个都认
     ["WeChat.exe", "Weixin.exe"].iter().any(|name| {
-        std::process::Command::new("tasklist")
-            .args(["/FI", &format!("IMAGENAME eq {name}"), "/NH"])
+        let mut command = std::process::Command::new("tasklist");
+        command.args(["/FI", &format!("IMAGENAME eq {name}"), "/NH"]);
+        // 不留控制台窗口：探测每轮心跳都跑，黑窗会跟着心跳节奏在客户桌面上闪。
+        crate::backend::process::hidden(&mut command);
+        command
             .output()
             .map(|output| String::from_utf8_lossy(&output.stdout).contains(name))
             .unwrap_or(false)

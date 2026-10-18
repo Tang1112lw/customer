@@ -49,6 +49,7 @@ winit = "0.30"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
+    "Win32_System_Console",
     "Win32_UI_WindowsAndMessaging",
     # 找微信安装路径要读注册表（装在 D 盘等非默认目录时，只有注册表查得到）
     "Win32_System_Registry",

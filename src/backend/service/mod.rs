@@ -30,6 +30,22 @@ use tokio::{process::Command, sync::RwLock, time::timeout};
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
+/// 不留控制台窗口地启动辅助程序（仅 Windows）。
+///
+/// 辅助程序（导出 / 抓密钥 / 归档）都是控制台 exe。服务进程自己的窗口已经藏掉
+/// （见 crate 根 `main.rs` 的 `hide_own_console`），子进程默认继承那个隐藏
+/// 控制台；这里再显式加一次 CREATE_NO_WINDOW，是为了服务万一以别的方式被
+/// 拉起（带着可见控制台）时，采集一跑客户桌面上也不会闪黑窗。
+///
+/// 刻意不复用 `crate::process::hidden`：那是 `std::process::Command` 的版本，
+/// 而这里用 tokio 的 Command（另一个类型，creation_flags 是它的固有方法）——
+/// 强转类型只会把调用点搞得更难读。
+#[cfg(windows)]
+fn hidden(command: &mut Command) {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
@@ -190,6 +206,8 @@ impl Service {
             .current_dir(&self.tools)
             .stdin(Stdio::null())
             .kill_on_drop(true);
+        #[cfg(windows)]
+        hidden(&mut command);
         let output = timeout(limit, command.output())
             .await
             .map_err(|_| {
@@ -225,8 +243,11 @@ impl Service {
     }
 
     pub(crate) async fn version(&self, program: &str) -> ApiResult<Value> {
-        let output = Command::new(self.tools.join(program))
-            .args(["version", "--json"])
+        let mut command = Command::new(self.tools.join(program));
+        command.args(["version", "--json"]);
+        #[cfg(windows)]
+        hidden(&mut command);
+        let output = command
             .output()
             .await
             .map_err(|_| ApiError::helper("版本查询失败"))?;
@@ -237,8 +258,11 @@ impl Service {
     }
 
     pub async fn help(&self, program: &str) -> ApiResult<String> {
-        let output = Command::new(self.tools.join(program))
-            .arg("help")
+        let mut command = Command::new(self.tools.join(program));
+        command.arg("help");
+        #[cfg(windows)]
+        hidden(&mut command);
+        let output = command
             .output()
             .await
             .map_err(|_| ApiError::helper("帮助查询失败"))?;

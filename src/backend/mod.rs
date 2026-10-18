@@ -1,7 +1,15 @@
 #[path = "../shared/sha256.rs"]
 pub(crate) mod sha256;
+#[path = "../shared/base64.rs"]
+pub(crate) mod base64;
 #[path = "../shared/cache.rs"]
 pub(crate) mod cache;
+// 进程工具（藏窗 / 探测）：起辅助程序与 tasklist 探测要用。同一份文件被界面类
+// 二进制经 shared/mod.rs 整体引入，服务端按需单独引入 —— 服务只用到其中两项，
+// 模块级豁免压掉"这个二进制没用到那个条目"的噪音（shared/mod.rs 同款约定）。
+#[allow(dead_code)]
+#[path = "../shared/process.rs"]
+pub(crate) mod process;
 #[path = "../shared/self_name.rs"]
 pub(crate) mod self_name;
 #[path = "../shared/session.rs"]

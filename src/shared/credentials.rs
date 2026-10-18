@@ -35,13 +35,26 @@ fn harden(path: &Path) -> Option<String> {
         format!("{domain}\\{user}")
     };
 
-    let status = Command::new("icacls")
+    let mut command = Command::new("icacls");
+    command
         .arg(path)
         .arg("/inheritance:r")
         .arg("/grant:r")
         .arg(format!("{identity}:(F)"))
         .arg("*S-1-5-18:(F)")
-        .arg("*S-1-5-32-544:(F)")
+        .arg("*S-1-5-32-544:(F)");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // 不留控制台窗口地执行：登录写令牌时会调到这里，黑窗在客户桌面上
+        // 一闪而过就是"这软件在偷偷跑命令"（实测被这么问过）。
+        // 这里刻意不调 shared::process::hidden：共享文件之间零交叉依赖
+        // （见 shared/mod.rs 约定），credentials 可能被单独按需引入。
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let status = command
         .output();
 
     match status {

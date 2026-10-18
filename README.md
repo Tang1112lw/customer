@@ -21,20 +21,20 @@
 | 二进制 | 入口 | 作用 | 用法 |
 | --- | --- | --- | --- |
 | `aicrm_windows_api` | `src/main.rs` | 后台服务：HTTP 接口 + 云端命令通道。参数全部可选，默认从 exe 同目录读配置 | 无界面，由 `HKCU\...\Run` 隐藏启动 |
-| `aicrm-console` | `src/forckend/console.rs` | 主窗口：侧边栏 + 状态总览（云端 / 密钥 / 服务）+ 配置页 + 账号菜单；**登录 / 重新登录 / 首次「连接云端」配对都在这一窗口内完成**；**托管本地服务**；托盘形态由 `--hidden` 提供（原独立托盘程序已并入） | 无参数；`--hidden` 只进托盘不弹窗；`--start-service` 只起服务不显示窗口 |
+| `aicrm-console` | `src/forckend/console.rs` | 主窗口：主界面只剩「最近采集」记录；右上角显示绑定状态（已绑定 / 未绑定 + 微信号），点它展开账号菜单（重新登录 / 退出登录）；「配置」页入口已隐藏（页面代码保留，改云端地址走重装或直接编辑安装目录下的 `cloud.url`）；**登录 / 重新登录都在这一窗口内完成**（登录引导页为玻璃质感 + 左侧浅绿玻璃品牌栏）；**托管本地服务**；托盘形态由 `--hidden` 提供（原独立托盘程序已并入） | 无参数；`--hidden` 只进托盘不弹窗；`--start-service` 只起服务不显示窗口 |
 | `aicrm-update` | `src/update/main.rs` | **原生更新器**（取代 PowerShell 脚本）：校验摘要与目标名白名单 → 先停客户端进程 → 备份 → 覆盖 → 按 `startup.json` 重启 → 探活失败回滚；也承担快捷方式创建（`--ensure-shortcut`）与旧程序清理 | 由服务在应用更新时拉起；`--ensure-shortcut` 供安装脚本调用 |
-| `aicrm-setup` | `src/forckend/setup.rs` | **静默安装**：不问任何东西，打开即装盘 → 装完自动拉起客户端 → 自己退出。**窗口创建失败（显卡只给 OpenGL 1.1）时自动降级为无界面安装**，不再以"启动失败"收场 | `--endpoint`；`--extract-only` 自检内嵌载荷；`--silent` 强制无界面安装。单文件形态由 `aicrm-pack` 拼出 |
+| `aicrm-setup` | `src/forckend/setup.rs` | **静默安装**：不问任何东西，打开即装盘 → 装完自动拉起客户端 → 自己退出。窗口 560×480（与登录窗同尺寸）、玻璃质感；环境检测以进度条呈现（检测中扫描动画 / 通过满格绿条 / 未通过给出第一条必须项原因，明细写错误日志）。OpenGL 已随包（软件渲染兜底），任何机器都开得出窗口；窗口创建失败会明确报错，不再降级无界面安装（2026-10-13 删除该路径） | `--endpoint`；`--extract-only` 自检内嵌载荷；`--check` 无界面环境自检（给支持人员，不安装）。单文件形态由 `aicrm-pack` 拼出 |
 | `aicrm-pack` | `src/pack/main.rs` | 打包工具：安装器 + 全部载荷 → 单文件安装程序 | `cargo run --release --bin aicrm-pack [输出路径]` |
 
 （`aicrm-login.exe` 登录窗口已于 2026-10-10 并入主控台，不再分发。）
 
 四件事值得记一笔：
 
-- **外观统一**：`src/forckend/theme.rs` 是两个窗口（主控台、安装器）共用的外观（浅色底、白卡片、描边、留白），各自 `mod theme;` 指向同一份文件，不引入共享库。跨二进制共享的无界面工具统一在 `src/shared/`（路径约定 / 设备凭据 / 进程管理 / 字体 / 缓存探测 / 机主昵称），各二进制按需引入。
+- **外观统一**：`src/forckend/theme.rs` 是两个窗口（主控台、安装器）共用的外观（浅色底、白卡片、描边、留白），各自 `mod theme;` 指向同一份文件，不引入共享库。跨二进制共享的无界面工具统一在 `src/shared/`（路径约定 / 设备凭据 / 进程管理 / 字体 / 缓存探测 / 机主昵称 / base64 / sha256），各二进制按需引入。
 - **主窗口不依赖服务**：它直接读安装目录里的文件（令牌、密钥、`cloud.url`、`data/jobs`），因为它的职责之一就是"服务没跑时把服务拉起来"。宽高固定、长文本截断，避免窄窗口把中文挤成竖排。
 - **单文件安装程序**：`aicrm-pack` 把 `aicrm-setup.exe` 与载荷 zip 拼在一起，页脚 `[offset u64][len u64]["AICRMSFX"]`；安装器启动时读自身末尾定位并解压载荷，没有页脚就退回"同目录"布局。载荷清单在 `src/pack/main.rs` 顶部。输出名是 `AICRM-<版本号>.exe`，版本号取自 `Cargo.toml`，不用手工同步。
 - **一个时间只有一个界面**：`src/forckend/single.rs` 用命名互斥体 `Local\AICRM.WinClient` 做单实例，主界面与安装器**共用同一把锁**，所以两者不会并排出现。重复启动时把已有窗口 `SW_RESTORE` + 置前，而不是再开一个。开窗前先 `acquire()`；安装器装完要拉起主界面前必须 `release()`，否则主界面会被自己那把锁挡掉（表现为"装完了但客户端弹不出来"）。
-- **打开客户端 = 服务就该在跑**：主窗口启动时托管 `aicrm_windows_api.exe`，每 5 秒的刷新里检查一次，没起就拉起、掉了就重启。用户手点「停止服务」时置 `auto_service=false` 不再自动拉起，点「启动服务」恢复。服务是采集和心跳的载体，它一掉云端立刻把设备标离线，网页端也就点不动「绑定微信」。
+- **打开客户端 = 服务就该在跑**：主窗口启动时托管 `aicrm_windows_api.exe`，每 5 秒的刷新里检查一次，没起就拉起、掉了就重启。主界面的启停按钮撤下后（2026-10-13），入口只剩托盘菜单：托盘「停止服务」置 `auto_service=false` 不再自动拉起，托盘「启动服务」置回 `true` 恢复托管。服务是采集和心跳的载体，它一掉云端立刻把设备标离线，网页端也就点不动「绑定微信」。
 
 托盘（`aicrm-console --hidden` 的形态）图标颜色就是服务状态（绿=运行中、灰=已停止），菜单里「令牌」一项看 `api.token` 是否非空；「服务在不在」是直接连 `--bind` 端口判定的，比查进程名更能说明"到底能不能用"。
 
@@ -209,7 +209,7 @@ Start-Process pwsh -ArgumentList '-NoProfile','-File','.\mock-agent-cloud.ps1','
 
 ## 接口
 
-除下面单列的握手端点外，所有接口都要求 `Authorization: Bearer <token>`，token 在 `%LOCALAPPDATA%\AICRM-Windows-API\api.token`。接口层只解析请求、调用 `backend/service/` 的函数。该目录按辅助程序拆分：`service/mod.rs` 是共享底座（服务状态、进程调用、并发闸门、`authorize` 鉴权中间件），`service/key_service.rs` 承载 `AICRM-Key.exe` 业务（密钥准备、账号查询），`service/export_service.rs` 承载 `aicrm-export-new.exe` 业务（Markdown 导出执行），`service/archive_service.rs` 承载 Markdown 归档打包与上传（数据采集闭环上半段），`service/agent_service.rs` 是云端命令通道（长轮询 + 心跳）。跨二进制共享的无界面工具在 `src/shared/`（路径约定 / 设备凭据 / 进程管理 / 缓存探测 / 机主昵称）。
+除下面单列的握手端点外，所有接口都要求 `Authorization: Bearer <token>`，token 在 `%LOCALAPPDATA%\AICRM-Windows-API\api.token`。接口层只解析请求、调用 `backend/service/` 的函数。该目录按辅助程序拆分：`service/mod.rs` 是共享底座（服务状态、进程调用、并发闸门、`authorize` 鉴权中间件），`service/key_service.rs` 承载 `AICRM-Key.exe` 业务（密钥准备、账号查询），`service/export_service.rs` 承载 `aicrm-export-new.exe` 业务（Markdown 导出执行），`service/archive_service.rs` 承载 Markdown 归档打包与上传（数据采集闭环上半段），`service/agent_service.rs` 是云端命令通道（长轮询 + 心跳）。跨二进制共享的无界面工具在 `src/shared/`（路径约定 / 设备凭据 / 进程管理 / 字体 / 缓存探测 / 机主昵称 / base64 / sha256）。
 
 鉴权不在各模块内单独实现，而是在 `backend/mod.rs` 的 `app()` 里通过唯一的 `route_layer` 统一施加到全部已注册路由上。新增模块只需写一个 `pub fn router() -> Router<Arc<Service>>` 并在 `app()` 中 `merge` 一行，其所有接口自动受保护，无需写任何鉴权代码；所有 `merge` 都必须写在 `route_layer` 之前。用 `route_layer` 而非 `layer`，是为了让未匹配的路径保持 404 而不是变成 401。`backend/mod.rs` 的测试会遍历表里全部 8 个接口，确认无 token、错 token、其它认证方案均返回 401。
 
@@ -284,6 +284,97 @@ Invoke-RestMethod "$base/api/aicrm/export" -Method Post -Headers $headers `
 
 ## 更新记录
 
+### 2026-10-15（安装器：任何机器都装得上 · 归档带当天媒体预算）
+
+**背景**：客户（开发机）双击安装程序再次看到「AICRM 安装程序启动失败：
+egui_glow: OpenGL: egui_glow requires opengl 2.0+」，一个文件都没装上。
+10-12 已随包带了 Mesa 软件 OpenGL、10-13 又删掉了降级兜底，结果**安装器自己**
+成了那台开不出窗口的机器 —— 单文件 GUI 的旁挂 DLL 到不了它，删掉兜底等于删掉
+安装能力本身。
+
+**改法**：
+
+- **安装器自带软件 OpenGL**（`setup.rs`）：`opengl32.dll` 是编译期导入表依赖，
+  进程一启动就由 loader 按「应用目录优先」解析，运行期 `SetDllDirectory` 来不及。
+  改为启动时把载荷里的 5 个 Mesa DLL 和**自身副本**落进同一个临时目录，从副本重启
+  （带 `AICRM_SWGL_STAGED` 防循环 + `GALLIUM_DRIVER=llvmpipe`）—— loader 于是优先
+  加载 Mesa，安装窗口在只有 OpenGL 1.1 的机器上也能开。
+- **只走有界面一条路，不再留无界面安装兜底**：随包 Mesa 已保证任何机器都开得出
+  窗口，开不出就是明确故障 —— 报错退出并写日志，不静默降级。客户看不到安装过程
+  比装不上更糟（2026-10-15 用户明确要求：必须使用 OpenGL）。
+- **安装全程持单实例锁**：曾「开装即放锁」，重复双击会并发跑两个 `install.ps1`，
+  并发写同一个安装目录 —— 安装就这样莫名其妙失败。锁持到装完，`install.ps1`
+  末尾不再自己拉起客户端（新增 `-LaunchConsole`，安装器传 false，由它统一拉）。
+- **拉起客户端移出 UI 线程**：`open_console` 里「等 1.5 秒看活没活」的重试原来跑在
+  `poll()`（界面线程），安装窗冻结至多 3 秒；整个挪进安装线程，界面只等一条消息。
+- **归档当天媒体总量上限 48MB**（`archive_service.rs`）：单文件 16MB 上限挡不住
+  「一天攒很多」—— 带图片视频的日子 Base64 后足以顶穿云端 128MB 请求体上限，
+  把**整包**归档带走。到顶当天收手，文字照发。
+- **`CREATE_NO_WINDOW` 收敛**：从 6 处副本收敛为 `shared/process.rs` 的 `hidden()`
+  一处（credentials 按「共享文件零交叉引用」约定保留自有副本；`service/mod.rs`
+  用的是 tokio Command，另一个类型，保留并注明原因）。
+- 文档同步：`项目架构.md` 改口（`--silent` 已删、降级路径恢复、新增安装器
+  OpenGL 小节）；归档 v3 的 media 双层上限写进注释与测试。
+
+### 2026-10-16（审查轮：安装器惰性重启 · 归档整包媒体预算 · 死代码清理）
+
+对 10-15/10-16 凌晨的改动做一轮两轴审查（规范 + 规格），修掉的问题：
+
+- **安装器改成惰性重启**：此前每次启动都无条件复制上百兆 Mesa + 自身副本再重启，
+  硬件 GL 完好的机器（绝大多数）白付一次复制与重启。现在先直接开窗口，只有
+  `run_native` 失败（只剩 OpenGL 1.1 的远程桌面会话、驱动没装全）才带 Mesa 重启
+  一次。配套修了一个会把这个优化变成事故的坑：**重启前必须放掉单实例锁** ——
+  `run()` 失败前已经拿过锁，不还回去，子进程开界面时会被"已有实例"直接挡掉
+  （正是以前修过的"装完了客户端弹不出来"）。
+- **窗口创建失败退出码 1**：此前报完弹窗后进程静默退 0，脚本与支持人员无法区分
+  "装完了"与"起不来"。
+- **open_console 不再谎报成功**：二次重试后客户端仍秒退时，此前返回
+  "已启动客户端" —— 界面显示"安装完成"而客户端根本没起来。现在明确报错并给出
+  手动双击的指引。
+- **归档第三道媒体闸：整包 64MB**：原有单文件 16MB + 单天 48MB 两道闸管不住
+  "很多天" —— 一次采集覆盖十来天就是近五百兆，Base64 后远超云端请求体上限
+  （128MB），整包上传失败、十多天文字一起丢。到顶后剩余媒体跳过（文字照发），
+  带回归测试（跨天累计，不断言按天分布 —— 扫描顺序看文件系统心情，但总量恒定）。
+- **删除死代码**：`cloud.rs` 的 `transport_warning`（登录页精简提示后无人调用）、
+  `theme.rs` 的 `WARN`（注释说安装器在用，实际两处都不用）、安装器里的
+  `mod cloud;`（整个模块在安装器里零引用）。
+- **install.ps1 trap 退出码改 2**：与 CheckOnly「有必须项没过」的 1 区分，
+  支持人员手工跑时看退出码就知道该看结论还是该看 ERROR 行。
+
+**实测**：打成单文件安装包（71.5MB）—— `--extract-only` 14 个文件完整（含 Mesa
+5 DLL）；`install.ps1 -CheckOnly` 退出码 0、6 项检查全过、stdout 按字节确认是
+正确 UTF-8（中文无乱码）；GUI 直开路径窗口正常；**惰性重启路径**用「Mesa 放副本旁
++ 故意设坏 `GALLIUM_DRIVER`」强制首次开窗失败复现：父进程（桌面副本）开窗失败 →
+放锁 → staging（`aicrm-swgl-<pid>`，5 DLL + exe 副本 6 个文件）→ 子进程从 staging
+启动、窗口正常、单实例锁正常拿到（证明放锁生效）、环境检查 6/6 通过。云端侧
+`aicrm-cloud` 已用合并后的源码重新构建部署，健康检查通过。
+
+### 2026-10-16（凌晨：安装器 staging 收尾三件套）
+
+对 10-15 的「自带 Mesa 重启自己」做一轮审查，实测复现了三个收尾问题，逐一修掉：
+
+- **装完删的是客户原本双击的那个安装包**：staging 重启后，子进程的
+  `current_exe()` 是临时目录里的副本，原来的自删逻辑删的是副本 —— 客户桌面上的
+  安装包原封不动，与「桌面只该有一个客户端图标」的意图相悖。父进程现在把原始路径
+  经 `AICRM_SETUP_ORIGIN` 透传给子进程，收尾删它；临时副本由父进程连 staging
+  目录一起收走。
+- **staging 目录纳入陈旧清理**：父进程被强杀 / 死机 / 重启时，
+  `aicrm-swgl-<pid>`（软件 OpenGL + 安装程序副本，约 130MB）会永久留在临时目录
+  —— 实测复现：一次调试中断就留了一坨，一个半小时后还在。`remove_stale_payload_dirs`
+  现在连 `aicrm-swgl-*` 一起清，正在运行的那个（`AICRM_SWGL_STAGE` 指明的）除外。
+- **staging 失败留痕**：此前任何一步失败都静默退回原进程，1.1 机器上随后只看到
+  OpenGL 报错、日志里查不到原因。现在失败原因写进 `install.err.log`
+  （「软件 OpenGL 就位失败」）；没有载荷（开发机直接跑 cargo 产物）不算故障，不写。
+- **顺手**：`--check` / `--extract-only` 不建窗口，跳过 staging（支持工具不必先复制
+  上百兆再重启一遍）；防重入标记与 staging 路径合并为一个 `AICRM_SWGL_STAGE`；
+  窗口创建失败的报错文案改成可执行版本（提示就位失败的常见原因）。
+
+**实测**（本机，硬件 GL 完好，靠环境变量强制 llvmpipe）：打成单文件安装包跑 GUI 路径
+—— 子进程从 `%TEMP%\aicrm-swgl-<pid>\` 启动、窗口正常创建、进程加载的
+`OPENGL32.dll` / `libgallium_wgl.dll` 确认来自该目录而非 System32；强杀父子进程后
+残留 128MB staging 目录，下一次运行被陈旧清理自动收掉；`--extract-only` 退出码 0、
+不再触发 staging。
+
 ### 2026-10-12（安装器：窗口起不来也能装）
 
 **背景**：客户机（Win10）双击安装程序报
@@ -351,7 +442,7 @@ Invoke-RestMethod "$base/api/aicrm/export" -Method Post -Headers $headers `
 - 客户端界面改走 **CPU 软件渲染**。状态窗口只在画面变化时重绘，实际基本无感；换来的是
   远程桌面 / 无驱动机器上窗口一定能开。
 - 包体 **+24MB**（就是 `libgallium_wgl.dll` 那一个 61.8MB 的文件）。
-- **安装器本身仍是单文件 GUI**，在只有 1.1 的机器上照旧走「无界面安装」（它没法给自己旁挂
+- **安装器本身仍是单文件 GUI**，在只有 1.1 的机器上照旧走「无界面安装」（该降级 2026-10-15 已按用户要求移除，安装器改为自带 Mesa 重启自己，见上文；它没法给自己旁挂
   DLL）—— 但装完之后客户端窗口一定能开，这正是客户要的结果。
 
 **构建前提**：`src/tools/swgl/` 沿用「载荷二进制不进 Git」的规矩（同 `AICRM-Key.exe`）。
@@ -379,6 +470,28 @@ Invoke-RestMethod "$base/api/aicrm/export" -Method Post -Headers $headers `
 **实测**：本机跑 `install.ps1 -CheckOnly` 输出 `CHECK|advisory|开机自启|pass|HKCU Run`、退出码 0；
 再故意把 `$runKey` 指向一个写不进去的位置，`Get-AutostartKind` 返回 `startup-folder` 并按预期
 生成了两条快捷方式。
+
+### 2026-10-13（下午：安装/登录界面玻璃化 · 检测改进度条 · 去提示文字）
+
+按客户逐轮预览选定方案实施（预览图与需求记录见 `项目/AICRM客户端精简/`）：
+
+- **玻璃质感**：egui 无背景模糊，玻璃感 = 浅灰绿底 × 半透明白层（82%）× 顶部 2px 受光高光边；`theme.rs` 新增 `glass_card` / `glass_side` / `glass_input` / `glass_progress` / `check_badge` / `glass_button` 一套 helper。侧栏是**整幅纯色**薄荷绿，不叠光泽层 —— 叠层硬边会在纯色上切出明暗带（客户反馈的"色彩断层"）。
+- **安装界面**（方案 C，Hero 居中）：窗口 520×546 → **560×480**（与登录窗同尺寸）；七项检查清单 → **进度条**（检测中扫描动画、通过满格绿条、未通过红条 + 第一条必须项原因，明细写错误日志）；48px 绿色对勾徽标；两个按钮**同宽同色对齐**（复用 `glass_button` 同一表单，仅宽窄/文字不同）；删除副标题、HTTPS 明文警告条等一切非必要提示文字。
+- **登录引导页**：重排为左侧浅绿玻璃品牌栏（AICRM 深绿字）+ 右侧玻璃表单卡；输入框改玻璃框；删除重复的「登录」标题与品牌图标，只留 AICRM 文字与按钮文字。
+- **删除无界面安装降级路径**：OpenGL 随包后开不出窗口就是明确故障，`install_without_window` / `--silent` / `--no-gui` / run_native 失败降级全部移除，失败时原生提示框报清原因；`--check` 无界面自检保留（支持诊断用）。
+- **顺带修复**：托盘「停止服务」补 `auto_service=false` 置位（此前停止后会被下一轮 5 秒刷新自动拉起，停止形同没停）；安装开始即放掉单实例锁（此前 install.ps1 装完自拉客户端会被安装器握着的手锁挡死，表现为"装完了客户端弹不出来"）。
+
+### 2026-10-13（主界面精简 · 全链路藏窗 · 窗口改小）
+
+按客户要求的一轮界面与部署整改（对应 `项目/AICRM客户端精简/需求文档.md`）：
+
+- **CMD 窗口全链路根治**：安装（`setup.rs` 的 powershell）、登录写令牌（`credentials.rs` 的 icacls）、心跳探测（`agent_service.rs` 的 tasklist）、辅助程序（`service/mod.rs` 的 `hidden()`）、更新探测（`shared/process.rs`）一律加 `CREATE_NO_WINDOW`；开机自启路径的服务控制台窗口由 `main.rs` 的 `hide_own_console()` 自藏（仅 release，debug 保留窗口看输出）。
+- **主界面只剩「最近采集」**：撤下云端连接卡片、密钥获取卡片（含「打开密钥目录」）、本地服务卡片，以及整套云端可达性探针（`spawn_probe` 等）；`Snapshot` 删掉只写不读的 `token` / `credential_ready` 字段。
+- **右上角改绑定状态胶囊**：只显示「已绑定 / 未绑定」，已绑定带微信号；整块即账号菜单入口（重新登录 / 退出登录，弹窗同步做小：148 → 112）。
+- **「配置」入口隐藏**：侧栏注释掉该入口，页面代码与内容原样保留（`#[allow(dead_code)]`）；改云端地址走重装或直接编辑安装目录下的 `cloud.url`。
+- **窗口改小**：780×604 → 560×480；登录页同步精简为「账号 / 密码 / 登录」。
+- **随包软件 OpenGL**（上一提交已带）： Mesa llvmpipe 的 5 个 DLL 随安装包装载，OpenGL 1.1 / 远程桌面等无硬件加速的客户环境也能开得出窗口。
+- 终审修复：托盘「停止 / 启动服务」补上 `auto_service` 置位（此前托盘停止后会被下一轮 5 秒刷新自动拉起，停止形同没停）；`binding()` 的 local_only 分支不再把导出昵称错配到首个就绪账号；顶栏显示名超长截断防溢出。
 
 ### 2026-10-10（重构：去重复 · 合并登录窗 · 零参数化 · 删除死接口）
 

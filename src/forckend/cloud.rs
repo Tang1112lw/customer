@@ -192,21 +192,6 @@ pub fn login(
     }
 }
 
-/// 非 HTTPS 且非本机地址时给出警告 —— 明文传密码是这套方案最危险的失误。
-pub fn transport_warning(endpoint: &str) -> Option<String> {
-    let lower = endpoint.to_ascii_lowercase();
-    if lower.starts_with("https://") {
-        return None;
-    }
-    let is_local = lower.starts_with("http://127.0.0.1")
-        || lower.starts_with("http://localhost")
-        || lower.starts_with("http://[::1]");
-    if is_local {
-        return None;
-    }
-    Some("警告：该地址不是 HTTPS，密码会以明文经过网络".to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,15 +333,5 @@ mod tests {
 
         let error = login(&endpoint, "zhangsan", "hunter2", "client-1").unwrap_err();
         assert!(matches!(error, LoginError::Protocol(_)), "{error:?}");
-    }
-
-    #[test]
-    fn plain_http_to_a_remote_host_is_flagged() {
-        assert!(transport_warning("https://api.example.com/api/login").is_none());
-        // 本机联调不算问题
-        assert!(transport_warning("http://127.0.0.1:9000/api/login").is_none());
-        assert!(transport_warning("http://localhost:9000/api/login").is_none());
-        // 明文发到公网必须报警
-        assert!(transport_warning("http://api.example.com/api/login").is_some());
     }
 }

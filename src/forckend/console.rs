@@ -48,12 +48,10 @@ use std::{
     os::windows::process::CommandExt,
     path::Path,
     process::Command,
-    sync::{mpsc, Arc, Mutex},
+    sync::mpsc,
     time::{Duration, Instant, SystemTime},
 };
 
-/// 服务默认监听地址，与 `install.ps1` 的 `-Bind` 默认值一致。
-const BIND: &str = "127.0.0.1:8765";
 /// 不留控制台窗口地启动服务（与 `install.ps1` 的 `-WindowStyle Hidden` 等价）。
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// 状态自动刷新间隔：只读本地文件，开销可以忽略。
@@ -118,9 +116,11 @@ fn run() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            // 加了左侧导航栏，改成横向比例：620 宽的竖窗塞不下侧栏 + 双列卡片
-            .with_inner_size([780.0, 604.0])
-            // 固定尺寸：两列卡片的布局在窄窗口下会把 CJK 文本压成竖排，
+            // 560×480（2026-10-13 按用户要求改小）：登录卡片（账号/密码/登录）
+            // 与主界面（侧栏 + 最近采集单列）都按"一屏一件事"布局，更宽的窗口
+            // 只会让内容孤零零漂在中间。主界面撤下双列卡片后不再需要 780 的横向比例。
+            .with_inner_size([560.0, 480.0])
+            // 固定尺寸：布局在窄窗口下会把 CJK 文本压成竖排，
             // 控制面板本来也不需要缩放
             .with_resizable(false)
             .with_visible(!hidden)
@@ -231,31 +231,9 @@ fn service_up() -> bool {
     TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok()
 }
 
-/// 云端可达性探针：后台线程每 15 秒读一次 `cloud.url` 探一次，绘制线程只读缓存。
-///
-/// 必须放后台 —— 在绘制线程里做网络请求会直接把界面卡住。
-fn spawn_probe(slot: Arc<Mutex<Option<bool>>>) {
-    std::thread::spawn(move || loop {
-        if let Ok(mut value) = slot.lock() {
-            *value = probe_cloud();
-        }
-        std::thread::sleep(Duration::from_secs(15));
-    });
-}
-
-/// 探一下云端根路径：能拿到任何 HTTP 响应就算通（404 也算，说明服务活着）。
-fn probe_cloud() -> Option<bool> {
-    let url = read_trimmed(&paths::cloud_url());
-    if url.is_empty() {
-        return None;
-    }
-    let agent: ureq::Agent = ureq::config::Config::builder()
-        .timeout_global(Some(Duration::from_secs(3)))
-        .http_status_as_error(false)
-        .build()
-        .into();
-    Some(agent.get(&url).call().is_ok())
-}
+// 云端可达性探针已随「云端连接」卡片一起撤下（2026-10-13）：主界面不再展示
+// 云端通不通，探针失去了唯一消费者。云端地址仍在「配置」页（入口暂隐藏）
+// 与安装目录的 cloud.url 里管理，服务每轮心跳重读它。
 
 fn ago(time: Option<SystemTime>) -> String {
     let Some(elapsed) = time.and_then(|time| SystemTime::now().duration_since(time).ok()) else {
@@ -284,17 +262,27 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
+/// 顶栏放得下的显示名。
+///
+/// 昵称是用户自己在微信里起的，长度没有保证；顶栏可用宽约 450（560 减去
+/// 侧栏 110），胶囊约 52，超长名字会把左侧标题顶出窗口。24 个字符
+/// （≈312px）是留了余量的上限，真实昵称远够。
+fn short_name(name: &str) -> String {
+    let mut out: String = name.chars().take(24).collect();
+    if name.chars().count() > 24 {
+        out.push('…');
+    }
+    out
+}
+
 /// 一次状态快照。全部来自本地文件与一次端口探测，不依赖服务在线。
 #[derive(Default)]
 struct Snapshot {
     service_up: bool,
-    /// 令牌类型（云端会话 / 本地令牌）+ 写入时间
-    token: Option<(String, Option<SystemTime>)>,
     accounts: Vec<String>,
     /// 真正可用的微信号：密钥本体与解密缓存（cache/）都在。
     /// 只有密钥没有 cache 时导出读不到库，必须区分出来。
     accounts_ready: Vec<String>,
-    credential_ready: bool,
     /// 微信号（昵称），从导出的 messages.json 里找；找不到回落显示 wxid
     wechat_name: Option<String>,
     /// 云端地址（`cloud.url` 的内容）。None = 还没配置。
@@ -310,11 +298,14 @@ struct Snapshot {
     service_version: Option<String>,
 }
 
-/// 侧边栏的两个页面。
+/// 侧边栏的页面。
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 enum Page {
     #[default]
     Main,
+    /// 「配置」页：侧边栏入口已按用户要求隐藏（2026-10-13），页面内容本身
+    /// 保留不变；放开侧边栏里注释掉的那两行即可恢复入口。
+    #[allow(dead_code)]
     Config,
     /// 首次打开、还没登录过账号时的引导页（登录成功后就不再出现）。
     Connect,
@@ -355,24 +346,6 @@ fn snapshot() -> Snapshot {
         service_up: service_up(),
         ..Default::default()
     };
-
-    let token_path = paths::api_token();
-    if let Ok(text) = std::fs::read_to_string(&token_path) {
-        let text = text.trim();
-        if !text.is_empty() {
-            let kind = if text.starts_with("eyJ") {
-                "云端会话"
-            } else {
-                "本地令牌"
-            };
-            snap.token = Some((
-                kind.to_owned(),
-                std::fs::metadata(&token_path)
-                    .ok()
-                    .and_then(|meta| meta.modified().ok()),
-            ));
-        }
-    }
 
     // 账号名由登录流程写进 account.name；文件不在就是没登录
     snap.account = std::fs::read_to_string(paths::account_name())
@@ -428,9 +401,6 @@ fn snapshot() -> Snapshot {
                 // 查错路径会把已经就绪的机器显示成「密钥不完整」。
                 let has_credential = entry.path().join("credentials.local.json").is_file();
                 let has_cache = decrypted_cache_ready(&dir.join("accounts"), &name);
-                if has_credential {
-                    snap.credential_ready = true;
-                }
                 if has_credential && has_cache {
                     snap.accounts_ready.push(name.clone());
                 }
@@ -486,8 +456,6 @@ struct Console {
     note: Option<String>,
     /// 正在编辑的云端地址；None = 非编辑态
     editing: Option<String>,
-    /// 云端可达性，由后台线程刷新
-    reachable: Arc<Mutex<Option<bool>>>,
     /// 通知区托盘；Windows 上要等事件循环起来才建得出来，所以第一帧才创建
     tray: Option<shell::Tray>,
     /// 建不出来就别每帧重试
@@ -509,14 +477,11 @@ struct Console {
 
 impl Console {
     fn new(visible: bool) -> Self {
-        let reachable = Arc::new(Mutex::new(None));
-        spawn_probe(reachable.clone());
         Self {
             snap: Snapshot::default(),
             refreshed: None,
             note: None,
             editing: None,
-            reachable,
             tray: None,
             tray_failed: false,
             visible,
@@ -604,10 +569,6 @@ impl Console {
         if visible {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
-    }
-
-    fn cloud_reachable(&self) -> Option<bool> {
-        self.reachable.lock().ok().and_then(|value| *value)
     }
 
     /// 退出登录：丢掉云端会话，换一把新的本地接口令牌。
@@ -698,6 +659,9 @@ impl eframe::App for Console {
                     self.set_visible(ctx, next);
                 }
                 Some(shell::Action::StartService) => {
+                    // 恢复托管：keep_service_alive 只认 auto_service，不置 true
+                    // 的话服务下次掉了不会再被拉回来。
+                    self.auto_service = true;
                     match service_command().spawn() {
                         Ok(_) => self.note = Some("正在启动服务…".to_owned()),
                         Err(error) => self.note = Some(format!("启动失败：{error}")),
@@ -705,8 +669,13 @@ impl eframe::App for Console {
                     self.refresh();
                 }
                 Some(shell::Action::StopService) => {
+                    // 手停就是手停：不置 false 的话，下一轮 5 秒刷新的
+                    // keep_service_alive 会立刻把服务拉回来，停止等于没停
+                    // （主界面「停止服务」按钮撤下后，托盘是唯一入口，
+                    // 这个置位不能再省）。
+                    self.auto_service = false;
                     process::stop_service();
-                    self.note = Some("已发送停止指令".to_owned());
+                    self.note = Some("已停止服务（不再自动拉起）".to_owned());
                     self.refresh();
                 }
                 // 直接退出进程：走视口 Close 会再触发一次下面的关闭拦截
@@ -722,6 +691,11 @@ impl eframe::App for Console {
 
         // 点 × = 隐藏到托盘，不退出（真正的退出在托盘菜单里）。
         // 托盘建不出来时不能拦截 —— 那就真成了"关掉就找不回来"。
+        //
+        // 注意：这不是 bug —— 后台服务要继续跟云端通信（心跳 / 命令通道），
+        // × 一退全退设备就离线了。要完全退出：右键通知区图标 →「退出」。
+        // （曾考虑首次隐藏时弹气泡说明去向，tray-icon 0.26 不支持通知，
+        // 裸调 Shell_NotifyIcon 不划算，先靠菜单文案与左键切换。）
         if self.tray.is_some() && ctx.input(|input| input.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.set_visible(ctx, false);
@@ -753,8 +727,9 @@ impl eframe::App for Console {
 impl Console {
     /// 左侧导航栏。总宽 130（含左右各 10 的内边距），内容宽 110。
     ///
-    /// 130 是收窄后的取值：三字导航（"主界面"）还放得下，再窄就得换图标，
-    /// 而只有两个入口时图标反而更难认。
+    /// 「配置」入口已按用户要求隐藏（2026-10-13），现在只剩「主界面」一项。
+    /// 栏宽保持 110 不动：窗口总宽是两列卡片时代定下的，收窄侧边栏只会让
+    /// 内容区左右失衡，而一个入口不需要更窄的栏。
     fn sidebar(&mut self, ui: &mut egui::Ui, height: f32) {
         egui::Frame::NONE
             .fill(theme::SIDEBAR)
@@ -770,10 +745,12 @@ impl Console {
                     if theme::nav_item(ui, "主界面", self.page == Page::Main) {
                         self.page = Page::Main;
                     }
-                    ui.add_space(2.0);
-                    if theme::nav_item(ui, "配置", self.page == Page::Config) {
-                        self.page = Page::Config;
-                    }
+                    // 「配置」入口按用户要求隐藏（2026-10-13）：改云端地址暂时走
+                    // 重装，或直接编辑安装目录下的 cloud.url（服务每轮心跳重读它，
+                    // 不用重启）。页面代码原样保留，放开下面两行即可恢复入口。
+                    // if theme::nav_item(ui, "配置", self.page == Page::Config) {
+                    //     self.page = Page::Config;
+                    // }
 
                     // 界面不显示版本号（对外只叫 AICRM）。版本仍随心跳上报，
                     // 需要时在云端「设备」页看。
@@ -814,8 +791,46 @@ impl Console {
         });
     }
 
-    /// 顶栏。右上角只放账号名 —— "谁登录了"是这里唯一值得说的信息，
-    /// 头像、登录状态、下拉箭头都是噪音。
+    /// 右上角的绑定状态：(颜色, 状态, 微信号)。
+    ///
+    /// 判定口径与已下线的「密钥获取」卡片一致：本机密钥与解密缓存都就绪才算
+    /// 「已绑定」（云端没登记但本机有可用密钥时同样算）—— 网页端对缺密钥的
+    /// 账号也按未绑定处理，这里如实同步。按用户要求（2026-10-13）只保留
+    /// 「已绑定 / 未绑定」两态，中间态（密钥不完整等）一律显示为未绑定。
+    fn binding(&self) -> (egui::Color32, &'static str, Option<String>) {
+        let ready = |wxid: &String| self.snap.accounts_ready.iter().any(|item| item == wxid);
+        if let Some(wxid) = self.snap.bound_wxid.as_ref().filter(|wxid| ready(wxid)) {
+            let name = self
+                .snap
+                .bound_name
+                .clone()
+                .or_else(|| self.snap.wechat_name.clone())
+                .unwrap_or_else(|| wxid.clone());
+            return (theme::OK, "已绑定", Some(short_name(&name)));
+        }
+        // 云端没登记，但本机躺着能用的密钥：同样是已绑定，别让人白担心。
+        if self.snap.bound_wxid.is_none()
+            && let Some(wxid) = self.snap.accounts_ready.first()
+        {
+            // wechat_name 取自最近一次导出的 messages.json，Snapshot 里没有
+            // 它和哪个 wxid 对应的记录：多个就绪账号时它很可能属于另一个账号，
+            // 拿来配 accounts_ready.first() 会张冠李戴（旧卡片同病）。只有
+            // 恰好一个就绪账号时才归得准；否则回落 wxid —— 密钥目录名至少
+            // 不会指错人。
+            let name = if self.snap.accounts_ready.len() == 1 {
+                self.snap.wechat_name.clone().unwrap_or_else(|| wxid.clone())
+            } else {
+                wxid.clone()
+            };
+            return (theme::OK, "已绑定", Some(short_name(&name)));
+        }
+        (theme::IDLE, "未绑定", None)
+    }
+
+    /// 顶栏。右上角只放绑定状态：已绑定（带上微信号）/ 未绑定。
+    ///
+    /// 点它展开账号菜单（重新登录 / 退出登录）—— 菜单入口与状态同一个位置，
+    /// 不再单独显示账号名：客户需要知道的是"绑没绑"，不是"谁登录了"。
     fn top_bar(&mut self, ui: &mut egui::Ui, width: f32) {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 56.0), egui::Sense::hover());
         ui.painter()
@@ -826,37 +841,59 @@ impl Console {
             egui::Stroke::new(1.0, theme::LINE),
         );
 
-        let label = self
-            .snap
-            .account
-            .clone()
-            .unwrap_or_else(|| "未登录".to_owned());
-        let font = egui::FontId::proportional(13.0);
-        let galley = ui
+        let (status_color, status, name) = self.binding();
+        // 先按中性色量尺寸（颜色不影响排版宽度），交互区定了再定色重排。
+        let status_font = egui::FontId::proportional(12.0);
+        let name_font = egui::FontId::proportional(13.0);
+        let status_width = ui
             .painter()
-            .layout_no_wrap(label.clone(), font.clone(), theme::TEXT);
-        let text_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.right() - 20.0 - galley.size().x, rect.center().y - 9.0),
-            egui::vec2(galley.size().x, 18.0),
-        );
+            .layout_no_wrap(status.to_owned(), status_font.clone(), theme::TEXT)
+            .size()
+            .x;
+        let name_width = name
+            .as_ref()
+            .map(|name| {
+                ui.painter()
+                    .layout_no_wrap(name.clone(), name_font.clone(), theme::TEXT)
+                    .size().x
+                    + 6.0
+            })
+            .unwrap_or(0.0);
+        let pill_size = egui::vec2(status_width + 16.0, 21.0);
 
+        let pill = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - 20.0 - pill_size.x - name_width, rect.center().y - pill_size.y / 2.0),
+            pill_size,
+        );
         let response = ui.interact(
-            text_rect.expand2(egui::vec2(8.0, 7.0)),
+            egui::Rect::from_min_size(pill.min, egui::vec2(pill_size.x + name_width, pill_size.y))
+                .expand2(egui::vec2(8.0, 7.0)),
             ui.id().with("account"),
             egui::Sense::click(),
         );
-        let color = if response.hovered() {
-            theme::ACCENT
+        let (status_ink, name_ink) = if response.hovered() {
+            (theme::ACCENT, theme::ACCENT)
         } else {
-            theme::TEXT
+            (status_color, theme::TEXT)
         };
-        ui.painter().text(
-            egui::pos2(text_rect.right(), rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            &label,
-            font,
-            color,
+
+        // 胶囊底：同色系淡底 + 圆角（已下线卡片的视觉语言，挪到顶栏）。
+        ui.painter().rect_filled(
+            pill,
+            egui::CornerRadius::same(10),
+            egui::Color32::from_rgba_unmultiplied(status_ink.r(), status_ink.g(), status_ink.b(), 26),
         );
+        let status_galley = ui
+            .painter()
+            .layout_no_wrap(status.to_owned(), status_font, status_ink);
+        let status_pos = pill.center() - status_galley.size() * 0.5;
+        ui.painter().galley(status_pos, status_galley, status_ink);
+        if let Some(name) = name {
+            let name_galley = ui.painter().layout_no_wrap(name, name_font, name_ink);
+            let name_pos =
+                egui::pos2(pill.right() + 6.0, rect.center().y - name_galley.size().y * 0.5);
+            ui.painter().galley(name_pos, name_galley, name_ink);
+        }
 
         if response.clicked() {
             self.account_menu = !self.account_menu;
@@ -867,22 +904,25 @@ impl Console {
         }
     }
 
-    /// 账号菜单。收起时完全不占位置，只有点了账号名才出现。
+    /// 账号菜单。收起时完全不占位置，只有点了右上角状态才出现。
+    ///
+    /// 按用户要求（2026-10-13）做小：只放两个按钮，收紧内边距与按钮 padding。
     fn account_popup(&mut self, ui: &mut egui::Ui, anchor: egui::Pos2) {
         let logged_in = self.snap.account.is_some();
         let mut close = false;
 
         egui::Area::new(ui.id().with("account-menu"))
             .order(egui::Order::Foreground)
-            .fixed_pos(anchor - egui::vec2(160.0, 0.0))
+            .fixed_pos(anchor - egui::vec2(122.0, 0.0))
             .show(ui.ctx(), |ui| {
                 egui::Frame::NONE
                     .fill(theme::CARD)
                     .stroke(egui::Stroke::new(1.0, theme::LINE))
-                    .corner_radius(10)
-                    .inner_margin(egui::Margin::symmetric(6, 6))
+                    .corner_radius(8)
+                    .inner_margin(egui::Margin::symmetric(5, 5))
                     .show(ui, |ui| {
-                        ui.set_width(148.0);
+                        ui.set_width(112.0);
+                        ui.spacing_mut().button_padding = egui::vec2(8.0, 3.0);
                         if theme::ghost_button(ui, "重新登录").clicked() {
                             // 登录在主控台内的连接页完成：登录成功后令牌落盘，
                             // 服务自动用新令牌重启，不需要再开第二个窗口。
@@ -906,144 +946,108 @@ impl Console {
         }
     }
 
-    /// 主界面。只回答一个问题：现在通不通。
+    /// 主界面。只保留「最近采集」（2026-10-13 按用户要求精简）：
+    /// 云端连接卡片、密钥卡片、本地服务卡片全部撤下 —— 绑定状态移到右上角，
+    /// 服务由托盘与后台自动托管（掉了自动拉起），不再需要客户盯着。
     fn main_page(&mut self, ui: &mut egui::Ui) {
-        const GAP: f32 = 12.0;
-        let inner = ((ui.available_width() - GAP) / 2.0 - theme::PAD * 2.0).max(200.0);
-        ui.horizontal(|ui| {
-            self.cloud_card(ui, inner);
-            self.wechat_card(ui, inner);
-        });
-        ui.add_space(12.0);
-        self.service_row(ui);
-        ui.add_space(18.0);
         self.jobs_section(ui);
-    }
-
-    /// 本地服务压成一行：状态、地址、启停按钮横着排，不单独占一张卡片的高度。
-    fn service_row(&mut self, ui: &mut egui::Ui) {
-        let (color, status) = if self.snap.service_up {
-            (theme::OK, "运行中")
-        } else {
-            (theme::BAD, "已停止")
-        };
-        let width = ui.available_width() - theme::PAD * 2.0;
-        theme::card(ui, width, |ui| {
-            ui.horizontal(|ui| {
-                theme::pill(ui, color, status);
-                ui.label(theme::muted("本地服务"));
-                ui.label(egui::RichText::new(BIND).size(13.0));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.snap.service_up {
-                        if theme::danger_button(ui, "停止服务").clicked() {
-                            process::stop_service();
-                            // 手停就是手停，别再自动把它拉回来。
-                            self.auto_service = false;
-                            self.note = Some("已停止服务（不再自动拉起）".to_owned());
-                            self.refresh();
-                        }
-                    } else if theme::primary_button(ui, "启动服务").clicked() {
-                        self.auto_service = true;
-                        match service_command().spawn() {
-                            Ok(_) => self.note = Some("正在启动服务…".to_owned()),
-                            Err(error) => self.note = Some(format!("启动失败：{error}")),
-                        }
-                        self.refresh();
-                    }
-                });
-            });
-        });
     }
 
     /// 登录引导页：还没登录过账号时才出现。
     ///
     /// 独立于主界面，不显示侧边栏 —— 这会儿"主界面/配置"都还没有意义，
     /// 连不上什么都是空的。
+    ///
+    /// 玻璃质感 + 左侧浅绿玻璃品牌栏（2026-10-13 用户选定方案）：只保留
+    /// 账号、密码与登录按钮 —— 云端地址归「配置」页管理，客户不需要知道它；
+    /// 提示文字与明文警告一并去掉，这一屏只让人做一件事：登录。
     fn connect_page(&mut self, ui: &mut egui::Ui) {
-        // 已登录又回到这一页 = 从账号菜单点了「重新登录」；首次打开则是「连接云端」。
-        let logged = logged_in();
-        ui.vertical_centered(|ui| {
-            ui.add_space(46.0);
-            ui.label(
-                egui::RichText::new(if logged { "重新登录" } else { "连接云端" })
-                    .size(18.0)
-                    .strong(),
-            );
-            ui.add_space(6.0);
-            ui.label(theme::muted(if logged {
-                "换账号后，这台客户端立刻归属到新账号"
-            } else {
-                "首次使用：用云端账号登录一次即可"
-            }));
-        });
-        ui.add_space(26.0);
-
+        // 玻璃底：盖住外层 Frame 的 CONTENT 填充
+        ui.painter()
+            .rect_filled(ui.max_rect(), egui::CornerRadius::ZERO, theme::GLASS_PAGE);
+        let height = ui.available_height();
         let busy = self.connect.step.is_some();
-        let width = (ui.available_width() - theme::PAD * 2.0).min(420.0);
-        ui.horizontal(|ui| {
-            ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
-            theme::card(ui, width, |ui| {
-                ui.label(theme::muted("云端地址"));
-                ui.add_space(5.0);
-                let mut base = cloud_base();
-                ui.add_enabled(
-                    false,
-                    egui::TextEdit::singleline(&mut base).desired_width(f32::INFINITY),
-                );
 
-                ui.add_space(15.0);
-                ui.label(theme::muted("账号"));
-                ui.add_space(5.0);
-                ui.add_enabled(
-                    !busy,
-                    egui::TextEdit::singleline(&mut self.connect.username)
-                        .hint_text("网页端用的同一个账号")
-                        .desired_width(f32::INFINITY),
+        ui.horizontal_top(|ui| {
+            // 左：浅绿玻璃品牌栏（整幅纯色，见 theme::glass_side）
+            theme::glass_side(ui, 200.0, height, |ui| {
+                ui.label(
+                    egui::RichText::new("AICRM")
+                        .size(17.0)
+                        .strong()
+                        .color(theme::GLASS_GREEN_INK),
                 );
+            });
 
-                ui.add_space(15.0);
-                ui.label(theme::muted("密码"));
-                ui.add_space(5.0);
-                let _ = ui.add_enabled(
-                    !busy,
-                    egui::TextEdit::singleline(&mut self.connect.password)
-                        .password(true)
-                        .desired_width(f32::INFINITY),
-                );
+            // 右：玻璃表单卡
+            ui.vertical(|ui| {
+                ui.set_width(ui.available_width().max(1.0));
+                ui.add_space(52.0);
+                let pad = 30.0;
+                ui.horizontal(|ui| {
+                    ui.add_space(pad);
+                    let width = (ui.available_width() - pad).max(200.0);
+                    theme::glass_card(ui, width, |ui| {
+                        ui.label(theme::muted("账号"));
+                        ui.add_space(5.0);
+                        let _ = theme::glass_input(
+                            ui,
+                            &mut self.connect.username,
+                            false,
+                            !busy,
+                        );
 
-                ui.add_space(18.0);
-                if busy {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(theme::muted(
-                            self.connect.step.as_deref().unwrap_or("正在连接…"),
-                        ));
+                        ui.add_space(15.0);
+                        ui.label(theme::muted("密码"));
+                        ui.add_space(5.0);
+                        let _ = theme::glass_input(
+                            ui,
+                            &mut self.connect.password,
+                            true,
+                            !busy,
+                        );
+
+                        ui.add_space(18.0);
+                        if busy {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(theme::muted(
+                                    self.connect.step.as_deref().unwrap_or("正在连接…"),
+                                ));
+                            });
+                        } else {
+                            let button = egui::Button::new(
+                                egui::RichText::new("登 录")
+                                    .size(13.0)
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(theme::ACCENT)
+                            .corner_radius(8)
+                            .min_size(egui::vec2(ui.available_width(), 36.0));
+                            if ui.add(button).clicked() {
+                                let ctx = ui.ctx().clone();
+                                self.start_connect(&ctx);
+                            }
+                        }
+
+                        if let Some(error) = &self.connect.error {
+                            ui.add_space(12.0);
+                            ui.label(egui::RichText::new(error).size(12.0).color(theme::BAD));
+                        }
                     });
-                } else if theme::primary_button(ui, if logged { "重新登录" } else { "连接" }).clicked() {
-                    let ctx = ui.ctx().clone();
-                    self.start_connect(&ctx);
-                }
-
-                if let Some(error) = &self.connect.error {
-                    ui.add_space(12.0);
-                    ui.label(egui::RichText::new(error).size(12.0).color(theme::BAD));
-                }
+                });
             });
         });
-
-        // 明文传密码是这套方案最危险的失误，与独立登录窗时一样常驻提示。
-        if let Some(warning) = cloud::transport_warning(&cloud_base()) {
-            ui.add_space(12.0);
-            ui.vertical_centered(|ui| {
-                ui.label(egui::RichText::new(warning).size(12.0).color(theme::BAD));
-            });
-        }
     }
 
     /// 配置页。只干一件事：改与云端的连接地址。
     ///
     /// 账号与客户端标识都是只读展示：账号决定云端认不认这台客户端，标识只用于
     /// 云端分辨同一账号的多台电脑，两者都不需要用户编辑。
+    ///
+    /// 侧边栏入口已按用户要求隐藏（2026-10-13），页面内容**原样保留**：
+    /// 放开侧边栏里注释掉的那两行即可恢复。
+    #[allow(dead_code)]
     fn config_page(&mut self, ui: &mut egui::Ui) {
         ui.label(theme::section("云端连接"));
         ui.add_space(10.0);
@@ -1171,141 +1175,6 @@ impl Console {
                     });
                 }
             }
-        });
-    }
-}
-
-impl Console {
-    fn wechat_card(&mut self, ui: &mut egui::Ui, width: f32) {
-        // 只认「**当前登录账号**在本机绑定的那个微信号」。
-        // 本机 accounts 目录里可能躺着别的账号采集过的密钥，拿第一个顶上会让客户
-        // 以为已经绑好了（实测踩过：登录 liang，卡片却显示 test2 的微信号）。
-        let bound = self.snap.bound_wxid.clone();
-        // 「就绪」= 密钥与解密缓存都在；只有密钥时是「密钥不完整」——
-        // 此时导出读不到聊天库，必须让客户看见，而不是写「就绪」。
-        let bound_ready = bound
-            .as_ref()
-            .map(|wxid| self.snap.accounts_ready.iter().any(|item| item == wxid))
-            .unwrap_or(false);
-        let bound_has_credential = bound
-            .as_ref()
-            .map(|wxid| self.snap.accounts.iter().any(|item| item == wxid))
-            .unwrap_or(false);
-        // 云端没登记时，**不要**直接写"尚未绑定微信号" —— 那会让客户以为本机没有密钥，
-        // 而实际上 accounts/ 里可能躺着能用的密钥（实测：本机导出能跑通 14 条消息，
-        // 卡片却写"尚未绑定"）。如实分开说：本机有没有密钥是一回事，
-        // 云端有没有把这个微信号登记到这台电脑是另一回事。
-        let local_only = if bound.is_none() {
-            self.snap.accounts_ready.first().cloned()
-        } else {
-            None
-        };
-        let (color, status) = match (bound.is_some(), bound_ready, bound_has_credential) {
-            // 密钥在就是「已绑定」——判定依据是本机密钥（核对过），不是云端那条记录。
-            (true, true, _) => (theme::OK, "已绑定"),
-            (false, _, _) if local_only.is_some() => (theme::OK, "已绑定"),
-            (true, false, true) => (theme::WARN, "密钥不完整"),
-            (true, false, false) => (theme::WARN, "缺密钥"),
-            (false, _, _) => (theme::IDLE, "未绑定"),
-        };
-        theme::card(ui, width, |ui| {
-            theme::card_head_rev(ui, "密钥获取", color, status);
-            ui.add_space(8.0);
-            match bound.as_deref() {
-                // 优先显示微信号（昵称）；没有导出数据时回落到 wxid（密钥目录名）
-                Some(wxid) => {
-                    let display = self
-                        .snap
-                        .bound_name
-                        .clone()
-                        .or_else(|| self.snap.wechat_name.clone())
-                        .unwrap_or_else(|| wxid.to_owned());
-                    ui.add(egui::Label::new(theme::value(&display)).truncate());
-                    if bound_ready {
-                        ui.label(theme::faint(wxid));
-                    } else if bound_has_credential {
-                        ui.label(theme::faint(&format!("已抓到 {wxid} 的密钥，但缺少解密缓存")));
-                        ui.label(theme::faint("请在微信已登录时重新绑定以获取密钥"));
-                    } else {
-                        ui.label(theme::faint(&format!("尚未采集 {wxid} 的密钥")));
-                    }
-                    // 这里原本还有一行"本机另有 N 个其他账号的密钥，当前账号不可用"——
-                    // 卡片上明明写着「密钥就绪」，它却读起来像"当前账号不能用"，客户直接
-                    // 被绕晕。别的声音去掉：只显示当前绑定的那个号的状态。
-                }
-                None => {
-                    match local_only.as_deref() {
-                        // 本机有可用密钥、云端没登记：这是**两件事**，得分开说清楚。
-                        Some(wxid) => {
-                            let display = self
-                                .snap
-                                .wechat_name
-                                .clone()
-                                .unwrap_or_else(|| wxid.to_owned());
-                            ui.add(egui::Label::new(theme::value(&display)).truncate());
-                            ui.label(theme::faint(&format!("本机已抓到 {wxid} 的密钥，解密缓存也在")));
-                            ui.label(theme::faint("云端还没把这个微信号登记到本机：在网页点「绑定微信账号」即可"));
-                        }
-                        None => {
-                            ui.label(theme::value("尚未绑定微信号"));
-                            ui.label(theme::faint("在云端网页「绑定微信」后回到这里"));
-                        }
-                    }
-                }
-            }
-            ui.add_space(10.0);
-            theme::divider(ui);
-            ui.add_space(10.0);
-            if theme::ghost_button(ui, "打开密钥目录").clicked() {
-                let _ = Command::new("explorer")
-                    .arg(install_dir().join("accounts"))
-                    .spawn();
-            }
-        });
-    }
-
-    /// 云端连接：只读展示 + 重新探测。
-    ///
-    /// 改地址的入口在「配置」页 —— 主界面的职责是回答"现在通不通"，
-    /// 把编辑框放在这里会让两种用途互相干扰。
-    fn cloud_card(&mut self, ui: &mut egui::Ui, width: f32) {
-        let (color, status) = match self.cloud_reachable() {
-            Some(true) => (theme::OK, "已连接"),
-            Some(false) => (theme::BAD, "不可达"),
-            None => (theme::IDLE, "未配置"),
-        };
-        let cloud = self.snap.cloud.clone();
-        let reachable = self.cloud_reachable();
-        theme::card(ui, width, |ui| {
-            theme::card_head_rev(ui, "云端连接", color, status);
-            ui.add_space(8.0);
-            match &cloud {
-                Some(url) => {
-                    ui.add(egui::Label::new(theme::value(url)).truncate());
-                    ui.label(theme::faint(match reachable {
-                        Some(true) => "连接正常",
-                        Some(false) => "连不上，检查「配置」里的地址",
-                        None => "正在探测…",
-                    }));
-                }
-                None => {
-                    ui.label(theme::value("未配置"));
-                    ui.label(theme::faint("到「配置」页填入云端地址"));
-                }
-            }
-            ui.add_space(10.0);
-            theme::divider(ui);
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if cloud.is_some() && theme::ghost_button(ui, "重新连接").clicked() {
-                    // 不等后台那 15 秒的轮询，立刻再探一次
-                    spawn_probe(self.reachable.clone());
-                    self.note = Some("正在重新探测云端…".to_owned());
-                }
-                if theme::ghost_button(ui, "去配置").clicked() {
-                    self.page = Page::Config;
-                }
-            });
         });
     }
 }

@@ -10,8 +10,32 @@ use std::{env, io, path::PathBuf, time::Duration};
 /// 这里只用来在云端连续报错时避免打爆它。
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// 藏掉自己的控制台窗口（仅 Windows release 构建）。
+///
+/// 开机自启（HKCU Run）是**直接**拉起服务 exe 的：控制台程序被这样启动会分到
+/// 一个可见的控制台窗口，一直挂在客户桌面上。这里在 main 最开头把它 Hide 掉。
+/// 由主控台（CREATE_NO_WINDOW）或安装脚本（`-WindowStyle Hidden`）拉起时
+/// 本来就没有窗口（GetConsoleWindow 返回空），这段什么也不做。
+/// debug 构建保留窗口：开发时 `cargo run` 直接看输出。
+#[cfg(all(windows, not(debug_assertions)))]
+fn hide_own_console() {
+    use windows_sys::Win32::System::Console::GetConsoleWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    // SAFETY: 只读本进程的控制台窗口句柄并藏窗，不碰其它进程的窗口。
+    unsafe {
+        let console = GetConsoleWindow();
+        if !console.is_null() {
+            ShowWindow(console, SW_HIDE);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 先藏窗口再干别的：开机自启路径下，晚一步客户就看见桌面上的黑窗了。
+    #[cfg(all(windows, not(debug_assertions)))]
+    hide_own_console();
+
     let root = env::current_exe()?.parent().unwrap().to_path_buf();
     let mut tools = root.join("tools");
     let mut keys = root.join("accounts");

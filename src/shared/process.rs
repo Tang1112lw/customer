@@ -26,16 +26,38 @@ pub const CLIENT_PROGRAMS: [&str; 3] = [
 /// 后台服务的镜像名。
 pub const SERVICE_PROGRAM: &str = "aicrm_windows_api.exe";
 
+/// 给命令加上「不留控制台窗口」（与 `install.ps1` 的 `-WindowStyle Hidden` 等价）。
+///
+/// 为什么收敛到这一处：`CREATE_NO_WINDOW = 0x0800_0000` 这对知识曾经散在 6 处
+/// （setup 三处、credentials、service/mod、agent_service），每处都自带一段注释
+/// 解释「为什么不能闪黑窗」，每次有人新起进程都要重新抄一遍，漏抄就是客户桌面
+/// 上多一个黑窗。从此一处定义、各处调用：
+///
+/// ```ignore
+/// let mut command = Command::new("taskkill");
+/// command.args(["/F", "/IM", name]);
+/// hidden(&mut command).output()
+/// ```
+#[cfg(windows)]
+pub fn hidden(command: &mut Command) -> &mut Command {
+    use std::os::windows::process::CommandExt;
+    /// 不留控制台窗口地执行。
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW)
+}
+
+/// 非 Windows 上没有这个标志，原样返回。
+#[cfg(not(windows))]
+pub fn hidden(command: &mut Command) -> &mut Command {
+    command
+}
+
 /// 结束一个进程（按镜像名）。忽略失败 —— 调用方按需确认结果。
 #[cfg(windows)]
 pub fn terminate(name: &str) {
-    use std::os::windows::process::CommandExt;
-    /// 不留控制台窗口地执行（与 `install.ps1` 的 `-WindowStyle Hidden` 等价）。
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let _ = Command::new("taskkill")
-        .args(["/F", "/IM", name])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
+    let mut command = Command::new("taskkill");
+    command.args(["/F", "/IM", name]);
+    let _ = hidden(&mut command).output();
 }
 
 /// 非 Windows 上不存在 taskkill；保留空实现让 `cargo check` 能过。
@@ -48,8 +70,9 @@ pub fn terminate(_name: &str) {}
 /// 更新器不能因为 tasklist 跑不起来就把一次正常的更新判成失败。
 pub fn running(name: &str) -> Option<bool> {
     let needle = name.to_ascii_lowercase();
-    Command::new("tasklist")
-        .args(["/FI", &format!("IMAGENAME eq {name}"), "/NH"])
+    let mut command = Command::new("tasklist");
+    command.args(["/FI", &format!("IMAGENAME eq {name}"), "/NH"]);
+    hidden(&mut command)
         .output()
         .ok()
         .map(|output| {

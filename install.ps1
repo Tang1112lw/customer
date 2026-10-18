@@ -19,10 +19,31 @@
 
     # 只做环境准备检查：打印 CHECK 行后退出，不写入任何文件。
     # 安装器界面用它画「环境准备」清单，人也可以直接跑来看结论。
-    [switch]$CheckOnly
+    [switch]$CheckOnly,
+
+    # 装完是否由本脚本拉起主窗口。安装器（aicrm-setup.exe）传 'false'：
+    # 它安装全程持着界面单实例锁，这里拉起 console 会被锁挡掉（console 自查
+    # 到已有实例就退），白闪一下；由安装器装完后统一拉起更干净（它 open_console
+    # 里还有「等 1.5 秒看活没活」的重试）。人工直接跑本脚本时保持默认 'true'。
+    # 刻意用 string 不用 [bool]：命令行调用模式下参数一律按字符串传递，
+    # 而 PowerShell 5.1 的 bool 参数不接受 "false"（只认 $True/$False/1/0，
+    # $ 过不了命令行）—— 实测环境检查与安装都炸在
+    # 「无法将值"System.String"转换为类型"System.Boolean"」。
+    [string]$LaunchConsole = 'true'
 )
 
 $ErrorActionPreference = 'Stop'
+
+# 任何失败都写成一行 ERROR 走 stdout 并非 0 退出：stdout 上面已被强制成 UTF-8，
+# 而 PowerShell 5.1 的 stderr 按系统 ANSI 代码页吐字节 —— 调用方（aicrm-setup.exe）
+# 按 UTF-8 读，中文报错全变成方块，客户看到的「环境检查没有返回结果」页就是一屏乱码。
+# 退出码用 2 而不是 1：1 保留给「检查做完了，但有必须项没过」这个结论（见下面
+# PreflightBlocked），trap 是脚本自己出事 —— 两个码分开，支持人员手工跑
+# -CheckOnly 时看退出码就知道该看结论还是该看 ERROR 行。
+trap {
+    Write-Output "ERROR: $_"
+    exit 2
+}
 
 # 让 stdout 走 UTF-8。否则 Windows PowerShell 5.1 会按系统 ANSI 代码页输出，
 # 被 aicrm-setup.exe 按 UTF-8 读时中文全变成方块。
@@ -434,7 +455,10 @@ if ($apiArgs) {
 
 # 主窗口自带通知区托盘（同一个进程），开机只静默进托盘，不弹窗口打扰客户。
 # 但装完这一次要弹出来，不然客户不知道装了什么。
-Start-Process -FilePath $consoleExe -WorkingDirectory $InstallDir
+# 安装器调用时由它自己拉起（见 -LaunchConsole），这里跳过。
+if ($LaunchConsole -ne 'false' -and $LaunchConsole -ne '0') {
+    Start-Process -FilePath $consoleExe -WorkingDirectory $InstallDir
+}
 
 # ---- 快捷方式：桌面 + 开始菜单，客户唯一需要认识的入口 ----
 # 由 aicrm-update.exe 用 COM IShellLink 建（纯 Rust，不经脚本宿主）——
